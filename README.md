@@ -1,3 +1,4 @@
+![](https://s2.loli.net/2025/03/08/YLGmvlR7VoEB3tN.png)
 ![](https://s2.loli.net/2025/03/07/8zOiCVWGXYDUywJ.png) 
 
 # AG - Ask GPT from CLI
@@ -17,7 +18,7 @@
 ### Basic Setup
 
 ```bash
-git clone https://github.com/yourusername/ag.git
+git clone https://github.com/moeleak/ag.git
 cd ag
 pip install -r requirements.txt
 ```
