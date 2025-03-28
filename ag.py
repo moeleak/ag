@@ -183,6 +183,7 @@ def main():
     parser.add_argument('--max_tokens', help='Maximum tokens', default=4096)
     parser.add_argument('--frequency_penalty', help='Frequency penalty', default=0.5)
     parser.add_argument('--presence_penalty', help='Presence penalty', default=0.5)
+    parser.add_argument('-g', '--grep_enabled', action='store_true', help='AI mode of grep', default=False)
     parser.add_argument('question', nargs='?', help='Direct question to ask GPT')
     args = parser.parse_args()
 
@@ -211,13 +212,31 @@ def main():
         readline.parse_and_bind('tab: complete')
     except ImportError:
         pass
+    
+    grep_prompt = ""
+    if args.grep_enabled:
+        grep_prompt = """
+I want you to act as a Linux grep command filter. I will provide you with command output (like `ls` results), and you will filter it based on the pattern I specify, similar to `grep`. Only return the matching lines, nothing else.
 
+For example, if I give you:
+"Example input:
+1.c
+2.c
+file.txt
+README.md"
+
+And the pattern is `"files with .c"` (or simply `.c`), you should return:
+"1.c
+2.c"
+DO NOT RETURN ANYTHING ELSE EXCEPT THIS!!!
+    """
+        
     if args.question:
         # Directly handle the question without entering interactive mode
-        processed = process_input(pipe_input+args.question)
+        processed = process_input(grep_prompt+args.question+pipe_input)
         pipe_input = ""
         messages.append({"role": "user", "content": processed})
-        sys.stdout.write("\n💡")
+        sys.stdout.write("\n💡:\n")
         response_content = stream_response(client, args.model, messages, args.max_tokens, args.frequency_penalty, args.presence_penalty)
         if response_content:
             messages.append({"role": "assistant", "content": response_content})
