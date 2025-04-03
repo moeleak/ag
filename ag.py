@@ -126,7 +126,7 @@ def stream_response(client: OpenAI, model: str, messages: List[Dict[str, str]],
 
     # --- Markers for non-hidden reasoning ---
     REASONING_START_MARKER = "--- Reasoning Content ---"
-    REASONING_END_MARKER = "\n--- End Reasoning ---"
+    REASONING_END_MARKER = "--- End Reasoning ---"
 
     def start_spinner():
         nonlocal spinner_active
