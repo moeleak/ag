@@ -143,153 +143,200 @@ def _api_worker(
 
 # --- Modified stream_response Function ---
 
+# --- Modified stream_response Function ---
+
 def stream_response(client: OpenAI, model: str, model_type: str, messages: List[Dict[str, str]],
                     max_tokens: int, frequency_penalty: Optional[float],
                     presence_penalty: Optional[float], hide_reasoning: bool) -> Optional[str]:
     """Streams response, optionally hiding reasoning with a spinner, supports Gemini-style delay."""
 
+    # --- 新增语言检测函数 ---
+    def detect_language(text: str) -> str:
+        """简单检测输入文本的主要语言"""                                                                                                                                        # 检查中文字符
+        if re.search(r'[\u4e00-\u9fff]', text):
+            return 'zh'
+        return 'en'
+    LANGUAGE_PROMPTS = {
+        'zh': "请用中文回答，且禁止加入拼音。",
+        'en': "Please respond in English."
+    }
+
     full_response_chunks = []
     processed_response_chunks = []
+    buffer = ''
+
+    if model_type == 'gemini' and messages:
+        last_user_message = next((msg['content'] for msg in reversed(messages) if msg['role'] == 'user'), '')
+        current_language = detect_language(last_user_message)
+
+        if len(messages) == 1:
+            language_prompt = LANGUAGE_PROMPTS.get(current_language, 'en')
+            messages[0]['content'] = f"{language_prompt}\n\n{messages[0]['content']}"
+
+    full_response_chunks = []
+    processed_response_chunks = [] # Stores content intended for history (no reasoning/think tags)
     buffer = '' # Buffer for standard <think> tag processing
 
-    is_reasoning_deepseek = False   # Track if we are actively processing DeepSeek reasoning_content
-    in_think_block_tag = False      # Track if we are inside a <think> tag block
-    spinner_active = False          # Track if the spinner animation is currently shown
-    spinner_chars = itertools.cycle(['|', '/', '-', '\\'])
-    first_content_received = False  # Track if any content has been received (for Gemini mode)
+    is_reasoning_deepseek = False
+    in_think_block_tag = False
+    spinner_active = False
+    # spinner_chars = itertools.cycle(['|', '/', '-', '\\'])
+    # spinner_chars = itertools.cycle(['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘'])
+    # spinner_chars = itertools.cycle(['░', '▒', '▓', '▒'])
+    # spinner_chars = itertools.cycle([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█', '▉', '▊', '▋', '▌', '▍', '▎', '▏'])
+    spinner_chars = itertools.cycle(['🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛'])
+    #spinner_chars = itertools.cycle(['🩷','❤️','🧡','💛','💚','🩵','💙','💜','🖤','🩶','🤍','🤎'])
+    #spinner_chars = itertools.cycle(['✊🏻','✊🏼','✊🏽','✊🏾','✊🏿'])
+    #spinner_chars = itertools.cycle(['💭','💬','💡','🧠'])
+    #spinner_chars = itertools.cycle(['😋','😛','😝','😜','🤪'])
+    first_content_received_gemini = False # Specifically for Gemini initial content detection
 
-    # --- Markers for non-hidden reasoning ---
+    # --- NEW STATE FLAG ---
+    strip_leading_newline_next_write = False
+
     REASONING_START_MARKER = "--- Reasoning Content ---"
     REASONING_END_MARKER = "--- End Reasoning ---"
 
     def start_spinner():
         nonlocal spinner_active
         if not spinner_active:
-            sys.stdout.write("Thinking... ")
+            sys.stderr.write("Thinking... ")
             spinner_active = True
-            sys.stdout.flush()
+            sys.stderr.flush()
 
     def update_spinner():
         if spinner_active:
             spinner_char = next(spinner_chars)
-            sys.stdout.write(f"\rThinking... {spinner_char}")
-            sys.stdout.flush()
+            sys.stderr.write(f"\rThinking... {spinner_char}")
+            sys.stderr.flush()
 
     def stop_spinner(success=True):
-        nonlocal spinner_active
+        nonlocal spinner_active, strip_leading_newline_next_write
         if spinner_active:
             symbol = "✅" if success else "❌"
-            # Clear the line before writing the final status
-            sys.stdout.write("\r" + " " * 20 + "\r") # Adjust width if needed
-            sys.stdout.write(f"Thinking... {symbol}\n") # Add newline after stopping
+            sys.stderr.write("\r" + " " * 20 + "\r")
+            sys.stderr.write(f"Thinking... {symbol}\n")
             spinner_active = False
-            sys.stdout.flush()
+            sys.stderr.flush()
+            # --- SET FLAG HERE ---
+            # Set the flag whenever the spinner stops due to incoming content or success
+            if success:
+                 strip_leading_newline_next_write = True
 
     q = queue.Queue()
     worker_thread = threading.Thread(
         target=_api_worker,
         args=(q, client, model, messages, max_tokens, frequency_penalty, presence_penalty),
-        daemon=True # Allows main thread to exit even if worker is stuck
+        daemon=True
     )
 
     worker_thread.start()
 
-    # --- Main loop to process queue items ---
-    final_status_success = True # Assume success unless error occurs
+    final_status_success = True
     try:
-        # Start spinner immediately if hiding reasoning (covers Gemini case)
         if hide_reasoning:
             start_spinner()
 
         while True:
             try:
-                # Wait for a short time for an item from the queue
                 item_type, data = q.get(timeout=0.1)
 
                 if item_type == 'CHUNK':
                     chunk = data
+                    if not chunk.choices: continue
                     delta = chunk.choices[0].delta
+                    if delta is None: continue
+
                     reasoning_content = getattr(delta, 'reasoning_content', None)
                     content = delta.content
 
-                    # --- Stop Gemini spinner on first content ---
-                    if model_type == 'gemini' and content and not first_content_received and spinner_active:
-                         stop_spinner()
-                         first_content_received = True # Mark that content has started
+                    # --- Stop Gemini spinner ---
+                    if model_type == 'gemini' and content and not first_content_received_gemini and spinner_active:
+                         stop_spinner() # This will set strip_leading_newline_next_write = True
+                         first_content_received_gemini = True
 
                     # --- Handle DeepSeek Reasoning ---
                     if reasoning_content:
                         if hide_reasoning:
-                            if not spinner_active: start_spinner() # Start if not already (e.g., if content came first)
+                            if not spinner_active: start_spinner()
                             update_spinner()
                         else:
-                            if spinner_active: stop_spinner() # Stop spinner if reasoning starts and we're not hiding
+                            if spinner_active: stop_spinner() # Stop if showing reasoning
                             if not is_reasoning_deepseek:
                                 is_reasoning_deepseek = True
-                                sys.stdout.write(REASONING_START_MARKER + "\n")
-                                sys.stdout.write(ANSI_GREEN)
+                                sys.stdout.write(REASONING_START_MARKER + "\n" + ANSI_GREEN)
                                 sys.stdout.flush()
                             sys.stdout.write(reasoning_content)
                             sys.stdout.flush()
-                        continue # Skip content processing for this chunk
+                        continue # Skip normal content processing
 
-                    # --- Handle Standard Content (including <think> tags) ---
+                    # --- Handle Standard Content ---
                     if content:
-                        # If DeepSeek reasoning was just happening, end it
+                        # End DeepSeek reasoning display if it was active
                         if is_reasoning_deepseek:
                             is_reasoning_deepseek = False
-                            if not hide_reasoning: # Only print markers if not hidden
-                                sys.stdout.write(ANSI_RESET)
-                                sys.stdout.write(REASONING_END_MARKER + "\n")
+                            if not hide_reasoning:
+                                sys.stdout.write(ANSI_RESET + REASONING_END_MARKER)
                                 sys.stdout.flush()
-                            # If hiding, the spinner might be stopped below or already stopped
 
-                        # Append to full response history regardless of hiding
-                        full_response_chunks.append(content)
+                        # Stop spinner if it's still active when regular content arrives
+                        # (This handles cases like DeepSeek without reasoning_content but with hidden <think>,
+                        # or just general delay before first content chunk when hide_reasoning is on)
+                        # Exclude Gemini because its spinner stop is handled above.
+                        if model_type != 'gemini' and spinner_active:
+                             stop_spinner() # This will set strip_leading_newline_next_write = True
+
+                        full_response_chunks.append(content) # Add raw content chunk to full history
                         buffer += content
 
-                        # Process buffer for <think> tags and normal output
-                        processed_chunk_for_buffer = ''
+                        # Process buffer for <think> tags and prepare output
+                        processed_chunk_for_history = '' # Content excluding <think> tags for history list
                         temp_buffer = buffer
                         buffer = ''
-                        output_buffer = '' # Collect output for this chunk before printing
+                        output_buffer = '' # Content to be printed to stdout this iteration
 
                         while temp_buffer:
                             if not in_think_block_tag:
                                 start_pos = temp_buffer.find('<think>')
-                                if start_pos == -1: # No more <think> tags in buffer
-                                    # Stop spinner *before* printing normal content if it's active
-                                    if spinner_active:
-                                        stop_spinner()
-                                    output_buffer += temp_buffer
-                                    processed_chunk_for_buffer += temp_buffer
+                                if start_pos == -1: # No <think> tag start
+                                    chunk_to_process = temp_buffer
                                     temp_buffer = ''
+
+                                    # Stop spinner if needed (e.g., content arrived while spinner was on)
+                                    # This might be redundant if stopped above, but safe.
+                                    if spinner_active:
+                                        stop_spinner() # Sets the flag
+
+                                    output_buffer += chunk_to_process
+                                    processed_chunk_for_history += chunk_to_process
+
                                 else: # Found <think> tag start
                                     before_think = temp_buffer[:start_pos]
-                                    # Stop spinner *before* printing normal content if it's active
-                                    if spinner_active and before_think:
-                                        stop_spinner()
-                                    output_buffer += before_think
-                                    processed_chunk_for_buffer += before_think
+                                    processed_chunk_for_history += before_think # Add to history
 
+                                    # Stop spinner if needed before processing pre-think content
+                                    if spinner_active and before_think:
+                                        stop_spinner() # Sets the flag
+
+                                    output_buffer += before_think # Add pre-think content to output
+
+                                    # Handle the <think> tag itself
                                     in_think_block_tag = True
                                     temp_buffer = temp_buffer[start_pos + len('<think>'):]
-
                                     if hide_reasoning:
-                                        if not spinner_active: start_spinner() # Start if not already active
+                                        if not spinner_active: start_spinner() # Start spinner for hidden think block
                                         update_spinner()
                                     else:
-                                        output_buffer += ANSI_GREEN # Start green for think block
+                                        output_buffer += ANSI_GREEN # Start green for visible think block
                             else: # Inside a <think> block
                                 end_pos = temp_buffer.find('</think>')
                                 if end_pos == -1: # Still inside <think> block
                                     if hide_reasoning:
                                         update_spinner()
-                                        # Consume the buffer content without adding to output/processed
+                                        # Consume buffer without adding to output/history
                                         temp_buffer = ''
                                     else:
-                                        output_buffer += temp_buffer # Print thinking content
-                                        # Do not add thinking content to processed_response_chunks
+                                        output_buffer += temp_buffer # Print visible thinking content
                                         temp_buffer = ''
                                 else: # Found </think> tag end
                                     think_content = temp_buffer[:end_pos]
@@ -297,39 +344,44 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                                     temp_buffer = temp_buffer[end_pos + len('</think>'):]
 
                                     if hide_reasoning:
-                                        update_spinner() # Update one last time before potential stop
-                                        # Don't stop spinner yet, wait for actual content or end of stream
+                                        update_spinner()
+                                        # Content inside hidden <think> is not added to output/history
                                     else:
-                                        output_buffer += think_content # Print thinking content
-                                        # Do not add thinking content to processed_response_chunks
-                                        output_buffer += ANSI_RESET # End green for think block
+                                        output_buffer += think_content # Print visible thinking content
+                                        output_buffer += ANSI_RESET # End green
 
-                        # Write the collected output for this chunk
-                        sys.stdout.write(output_buffer)
-                        processed_response_chunks.append(processed_chunk_for_buffer) # Add non-thinking parts to history
-                        sys.stdout.flush() # Flush after processing content buffer
+                        # --- Apply LSTRIP before writing to stdout ---
+                        if strip_leading_newline_next_write and output_buffer:
+                            output_buffer = output_buffer.lstrip('\n')
+                            # Only strip the *very first* time after spinner stops
+                            if output_buffer: # Don't reset if stripping made it empty
+                                strip_leading_newline_next_write = False
+
+                        # --- Write to stdout and store processed chunk ---
+                        if output_buffer:
+                            sys.stdout.write(output_buffer)
+                            sys.stdout.flush()
+                        if processed_chunk_for_history:
+                             processed_response_chunks.append(processed_chunk_for_history)
+
 
                 elif item_type == 'DONE':
                     break # Worker finished successfully
 
                 elif item_type == 'ERROR':
                     final_status_success = False
-                    stop_spinner(success=False)
+                    stop_spinner(success=False) # Stop spinner with failure
                     if is_reasoning_deepseek or in_think_block_tag:
                         if not hide_reasoning: sys.stdout.write(ANSI_RESET)
                     sys.stdout.flush()
-                    sys.stderr.write(f"\n{data}\n") # Print error message from worker
+                    sys.stderr.write(f"\n{data}\n")
                     return None # Indicate error
 
             except queue.Empty:
-                # Queue is empty, update spinner if active
                 if spinner_active:
                     update_spinner()
-                # Check if worker thread is still alive, if not, something went wrong
                 if not worker_thread.is_alive():
-                     # It might have finished between the q.get and this check,
-                     # or it might have died unexpectedly.
-                     # Check queue again briefly in case 'DONE' or 'ERROR' just arrived.
+                     # Check queue one last time in case DONE/ERROR arrived just now
                      try:
                          item_type, data = q.get_nowait()
                          if item_type == 'DONE': break
@@ -341,41 +393,36 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                              sys.stdout.flush()
                              sys.stderr.write(f"\n{data}\n")
                              return None
-                         # If it was a CHUNK, process it (shouldn't happen often here)
-                         # ... (add chunk processing logic if needed, though unlikely)
-
                      except queue.Empty:
-                         # Worker died without sending DONE or ERROR
-                         if final_status_success: # Avoid double message if error already handled
+                         if final_status_success: # Avoid double message
                              final_status_success = False
                              stop_spinner(success=False)
                              sys.stderr.write("\nWorker thread finished unexpectedly.\n")
-                         return None # Indicate error
-                     break # Exit loop if DONE/ERROR was found after thread died check
-
+                         return None
+                     break # Exit outer loop if DONE/ERROR found
 
         # --- Final Cleanup ---
-        # Stop spinner if it was still active at the end (e.g., hidden reasoning ended stream)
-        if spinner_active:
+        if spinner_active: # If loop finished while spinner was still active (e.g., hidden <think> at end)
             stop_spinner(success=final_status_success)
 
-        # Reset color if non-hidden reasoning was interrupted or ended stream
-        if is_reasoning_deepseek or in_think_block_tag:
+        if is_reasoning_deepseek or in_think_block_tag: # Reset color if needed
              if not hide_reasoning:
                  sys.stdout.write(ANSI_RESET)
                  sys.stdout.flush()
 
+        # Join the chunks meant for history
         processed_response = "".join(processed_response_chunks)
-        return processed_response # Return only the processed final 'content' for history
+        # We keep the lstrip here for the *returned value* to ensure history is clean,
+        # even if the printed output was handled differently.
+        return processed_response.lstrip('\n')
 
     except KeyboardInterrupt:
         final_status_success = False
-        stop_spinner(success=False) # Stop spinner with cross mark on interrupt
+        stop_spinner(success=False)
         if is_reasoning_deepseek or in_think_block_tag:
-            if not hide_reasoning: sys.stdout.write(ANSI_RESET) # Reset color if needed
+            if not hide_reasoning: sys.stdout.write(ANSI_RESET)
         sys.stdout.flush()
         sys.stderr.write("\nResponse generation interrupted by user.\n")
-        # Note: Worker thread might still be running, but daemon=True helps cleanup
         return None
     except Exception as e:
         final_status_success = False
@@ -384,15 +431,15 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
             if not hide_reasoning: sys.stdout.write(ANSI_RESET)
         sys.stdout.flush()
         sys.stderr.write(f"\nAn unexpected error occurred in stream_response: {str(e)}\n")
+        traceback.print_exc(file=sys.stderr) # Print full traceback
         return None
     finally:
-        # Ensure spinner is definitely stopped if an error occurred before final cleanup
-        if spinner_active:
-             # Clear the line properly before potentially exiting
-             sys.stdout.write("\r" + " " * 20 + "\r")
-             sys.stdout.flush()
-        # Wait briefly for the worker thread to potentially finish cleanup, though it's a daemon
-        # worker_thread.join(timeout=0.5) # Optional: wait briefly
+        # Ensure cursor is visible and line is clear if spinner was ever active
+        if 'spinner_active' in locals() and spinner_active:
+             sys.stderr.write("\r" + " " * 20 + "\r")
+             sys.stderr.flush()
+
+
 
 
 # --- setup_tty_stdin and restore_stdin ---
@@ -429,14 +476,15 @@ def setup_tty_stdin() -> Tuple[int, Optional[str]]:
             import readline
             # You might want specific bindings, e.g., history search
             readline.parse_and_bind('tab: complete')
+
             # Consider loading/saving history:
-            # history_file = os.path.join(os.path.expanduser("~"), ".ag_history")
-            # try:
-            #     readline.read_history_file(history_file)
-            # except FileNotFoundError:
-            #     pass
-            # import atexit
-            # atexit.register(readline.write_history_file, history_file)
+            history_file = os.path.join(os.path.expanduser("~"), ".ag_history")
+            try:
+                readline.read_history_file(history_file)
+            except FileNotFoundError:
+                pass
+            import atexit
+            atexit.register(readline.write_history_file, history_file)
         except ImportError:
             pass # Readline not available on all systems (e.g., standard Windows cmd)
 
