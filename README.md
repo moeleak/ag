@@ -1,6 +1,6 @@
 # AG - AI Command Line Assistant
 
-<script src="https://asciinema.org/a/R2KOpEIjL7HT4QzxLNuICaDTQ.js" id="asciicast-R2KOpEIjL7HT4QzxLNuICaDTQ" async="true"></script>
+[![asciicast](https://asciinema.org/a/R2KOpEIjL7HT4QzxLNuICaDTQ.svg)](https://asciinema.org/a/R2KOpEIjL7HT4QzxLNuICaDTQ)
 
 ## Overview
 AG is a powerful command-line interface (CLI) tool that allows you to interact with OpenAI-compatible AI models directly from your terminal. It supports both single-query mode and interactive chat sessions, with advanced features like file/URL content integration, command execution, and grep-like filtering.

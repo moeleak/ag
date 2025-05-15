@@ -187,11 +187,18 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
         sys.stdout.flush()
         thinking_indicator_on_screen = True
     def start_spinner():
-        nonlocal spinner_active
+        nonlocal spinner_active, first_content_received_gemini
+        if model_type == 'gemini' and first_content_received_gemini:
+            return # Do not start spinner for Gemini if content has already been received
+
         clear_thinking_indicator_if_on_screen()
         if not spinner_active:
             sys.stderr.write("Thinking... "); spinner_active = True; sys.stderr.flush()
     def update_spinner():
+        nonlocal first_content_received_gemini
+        if model_type == 'gemini' and first_content_received_gemini:
+            return # Do not update spinner for Gemini if content has already been received
+
         if spinner_active:
             sys.stderr.write(f"\rThinking... {next(spinner_chars)}"); sys.stderr.flush()
     def stop_spinner(success=True):
@@ -216,12 +223,16 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                     delta = chunk.choices[0].delta
                     if delta is None: continue
                     reasoning_content, content = getattr(delta, 'reasoning_content', None), delta.content
+                    
+                    # Stop spinner for Gemini on first actual content and set flag
                     if model_type == 'gemini' and content and not first_content_received_gemini and spinner_active:
-                        stop_spinner(); first_content_received_gemini = True
+                        stop_spinner() 
+                        first_content_received_gemini = True # Flag that Gemini content has started
+
                     if reasoning_content:
                         if hide_reasoning:
-                            if not spinner_active: start_spinner()
-                            update_spinner()
+                            if not spinner_active: start_spinner() # start_spinner will check gemini flag
+                            update_spinner() # update_spinner will check gemini flag
                         else:
                             if spinner_active: stop_spinner()
                             if not is_reasoning_deepseek:
@@ -236,7 +247,13 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                             if not hide_reasoning:
                                 sys.stdout.write(ANSI_RESET + REASONING_END_MARKER + "\n"); sys.stdout.flush()
                                 strip_leading_newline_next_write = True
-                        if model_type != 'gemini' and spinner_active: stop_spinner()
+                        
+                        # General stop_spinner (non-Gemini or Gemini before first content)
+                        if model_type != 'gemini' and spinner_active: 
+                            stop_spinner()
+                        # For Gemini, it's already handled by the specific block above.
+                        # If spinner is active here for Gemini, it means first content hasn't arrived yet.
+
                         full_response_chunks.append(content); buffer += content
                         processed_chunk_for_history_this_delta, current_processing_buffer, buffer = '', buffer, ''
                         output_to_print_for_normal_content, temp_idx = "", 0
@@ -262,8 +279,8 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                                         output_to_print_for_normal_content = ""
                                     temp_idx = think_start_pos + len('<think>'); in_think_block_tag = True
                                     if hide_reasoning:
-                                        if not spinner_active: start_spinner()
-                                        update_spinner()
+                                        if not spinner_active: start_spinner() # start_spinner will check gemini flag
+                                        update_spinner() # update_spinner will check gemini flag
                                     else:
                                         if spinner_active: stop_spinner()
                                         sys.stdout.write(ANSI_GREEN); sys.stdout.flush()
@@ -272,12 +289,12 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                                 if think_end_pos == -1:
                                     think_content_chunk = current_processing_buffer[temp_idx:]
                                     temp_idx = len(current_processing_buffer)
-                                    if hide_reasoning: update_spinner()
+                                    if hide_reasoning: update_spinner() # update_spinner will check gemini flag
                                     else: write_thinking_chunk_with_indicator(think_content_chunk)
                                 else:
                                     think_content_chunk = current_processing_buffer[temp_idx:think_end_pos]
                                     temp_idx = think_end_pos + len('</think>'); in_think_block_tag = False
-                                    if hide_reasoning: update_spinner()
+                                    if hide_reasoning: update_spinner() # update_spinner will check gemini flag
                                     else:
                                         clear_thinking_indicator_if_on_screen()
                                         sys.stdout.write(think_content_chunk + ANSI_RESET); sys.stdout.flush()
@@ -297,7 +314,7 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                     if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
                     sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
             except queue.Empty:
-                if spinner_active: update_spinner()
+                if spinner_active: update_spinner() # update_spinner will check gemini flag
                 if not worker_thread.is_alive():
                     clear_thinking_indicator_if_on_screen()
                     try:
