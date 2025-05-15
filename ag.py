@@ -16,13 +16,18 @@ import wcwidth
 from openai import OpenAI, APIError
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple, Any
+from urllib.parse import urlparse
+
+try:
+    from googlesearch import search as google_search_func # Alias to avoid name collision
+except ImportError:
+    google_search_func = None # Placeholder if not installed
 
 try:
     import readline
 except ImportError:
-    pass 
+    pass
 
-# 新增: 条件导入 termios
 try:
     import termios
     TERMIOS_AVAILABLE = True
@@ -37,6 +42,8 @@ DEFAULT_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_FREQUENCY_PENALTY = 0.5
 DEFAULT_PRESENCE_PENALTY = 0.5
+DEFAULT_SEARCH_RESULTS_LIMIT = 10 # Number of search results to fetch by default
+DEFAULT_SEARCH_SLEEP_INTERVAL = 0 # Sleep interval for google search (seconds)
 USER_AGENT = "Mozilla/5.0 (Windows NT 1.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
 ANSI_GREEN = '\033[32m'
@@ -44,6 +51,7 @@ ANSI_RESET = '\033[0m'
 ANSI_SAVE_CURSOR = '\033[s'
 ANSI_RESTORE_CURSOR = '\033[u'
 ANSI_CLEAR_SCREEN = '\033[2J\033[H'
+ANSI_EL = '\033[K' # Erase to end of line
 
 # --- Helper Functions (fetch_webpage, execute_command, process_input_directives) ---
 def fetch_webpage(url: str) -> Optional[str]:
@@ -58,10 +66,8 @@ def fetch_webpage(url: str) -> Optional[str]:
         text = soup.get_text(separator='\n', strip=True)
         return re.sub(r'\n\s*\n', '\n\n', text).strip()
     except requests.RequestException as e:
-        sys.stderr.write(f"Error fetching {url}: {str(e)}\n")
         return None
     except Exception as e:
-        sys.stderr.write(f"Error parsing {url}: {str(e)}\n")
         return None
 
 def execute_command(command: str) -> str:
@@ -83,8 +89,10 @@ def execute_command(command: str) -> str:
 
 
 def process_input_directives(input_str: str) -> str:
-    """Processes @file and @url directives in the input string."""
+    """Processes @file, @url, and @search directives in the input string."""
     processed_lines = []
+    spinner_chars_local = itertools.cycle(['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'])
+
     for line in input_str.splitlines():
         stripped_line = line.strip()
         if stripped_line.startswith('@file'):
@@ -106,10 +114,171 @@ def process_input_directives(input_str: str) -> str:
             match = re.match(r'@url\(([^)]+)\)', stripped_line)
             if match:
                 url = match.group(1).strip()
-                webpage_content = fetch_webpage(url)
-                if webpage_content:
-                    processed_lines.append(f"--- Content from {url} ---\n{webpage_content}\n--- End of {url} ---")
+                try:
+                    parsed_display_url_obj = urlparse(url)
+                    display_url_at_url = f"{parsed_display_url_obj.scheme}://{parsed_display_url_obj.netloc}"
+                    if len(display_url_at_url) > 50 : display_url_at_url = display_url_at_url[:47] + "..."
+                except Exception:
+                    display_url_at_url = url[:50] + "..." if len(url) > 50 else url
+
+                sys.stderr.write(f"Fetching content from URL: {display_url_at_url} ... ")
+                sys.stderr.flush()
+                
+                content_fetched_url = False
+                q_url = queue.Queue()
+                fetch_thread_url = threading.Thread(target=lambda func, u, q_res: q_res.put(func(u)), args=(fetch_webpage, url, q_url))
+                fetch_thread_url.start()
+
+                webpage_content_result = None
+                while fetch_thread_url.is_alive():
+                    sys.stderr.write(f"\r{ANSI_EL}Fetching content from URL: {display_url_at_url} ... {next(spinner_chars_local)}")
+                    sys.stderr.flush()
+                    time.sleep(0.1)
+                    try:
+                        webpage_content_result = q_url.get_nowait()
+                        content_fetched_url = True
+                        break
+                    except queue.Empty:
+                        continue
+                
+                fetch_thread_url.join()
+                
+                if not content_fetched_url: 
+                    try: 
+                        webpage_content_result = q_url.get_nowait()
+                    except queue.Empty: 
+                        webpage_content_result = None
+
+                if webpage_content_result:
+                    sys.stderr.write(f"\r{ANSI_EL}Fetching content from URL: {display_url_at_url} ... ✅ Done.\n")
+                    processed_lines.append(f"--- Content from {url} ---\n{webpage_content_result}\n--- End of {url} ---")
+                else:
+                    sys.stderr.write(f"\r{ANSI_EL}Fetching content from URL: {display_url_at_url} ... ❌ Failed.\n")
+                sys.stderr.flush()
             else:
+                 processed_lines.append(line)
+        elif stripped_line.startswith('@search'):
+            if google_search_func is None:
+                sys.stderr.write(f"{ANSI_EL}Error: The 'googlesearch-python' library is not installed. @search functionality is unavailable.\n"
+                                 f"{ANSI_EL}Please install it using: pip install googlesearch-python\n")
+                processed_lines.append(line)
+                continue
+
+            match = re.match(r'@search\(([^)]+)\)', stripped_line)
+            if match:
+                query = match.group(1).strip()
+                sys.stderr.write(f"Searching for '{query}'...  ") # This line will be overwritten by search status
+                sys.stderr.flush()
+                
+                search_results_urls = None # Initialize as None
+                search_error_msg = None
+
+                def perform_search_in_thread(q_search_results, search_query_param):
+                    nonlocal search_error_msg
+                    try:
+                        results = list(google_search_func(
+                            search_query_param,
+                            num_results=DEFAULT_SEARCH_RESULTS_LIMIT,
+                            lang='en',
+                            sleep_interval=DEFAULT_SEARCH_SLEEP_INTERVAL 
+                        ))
+                        q_search_results.put(results)
+                    except Exception as e:
+                        search_error_msg = str(e)
+                        q_search_results.put(None)
+
+                search_q = queue.Queue()
+                search_thread = threading.Thread(target=perform_search_in_thread, args=(search_q, query))
+                search_thread.start()
+
+                while search_thread.is_alive():
+                    sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... {next(spinner_chars_local)}")
+                    sys.stderr.flush()
+                    time.sleep(0.1)
+                
+                search_thread.join() 
+                
+                try:
+                    search_results_urls = search_q.get_nowait() 
+                except queue.Empty: 
+                    if not search_error_msg:
+                        search_error_msg = "Search thread did not return a result."
+
+                if search_error_msg: 
+                    sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... ❌ Error: {search_error_msg}\n")
+                elif search_results_urls is None: # Error indicated by thread putting None
+                    sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... ❌ An unspecified error occurred during search.\n")
+                elif not search_results_urls: 
+                    sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... No results found.\n")
+                else: 
+                    sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... ✅ Found {len(search_results_urls)} results.\n")
+                sys.stderr.flush()
+
+                # --- MODIFIED FETCHING LOOP FOR SINGLE LINE UPDATE ---
+                if search_results_urls: # Only proceed if search was successful and returned URLs
+                    num_total_results = len(search_results_urls)
+                    processed_lines.append(f"--- Search results for query: \"{query}\" (top {num_total_results}) ---")
+                    
+                    base_fetch_msg_template = f"Fetching content from {num_total_results} result(s)"
+                    # Initial placeholder print for the fetching line
+                    sys.stderr.write(f"{base_fetch_msg_template} [0/{num_total_results}]...")
+                    sys.stderr.flush()
+                    
+                    successful_fetches = 0
+
+                    for i, url_from_search in enumerate(search_results_urls):
+                        try:
+                            parsed_url = urlparse(url_from_search)
+                            netloc_display = parsed_url.netloc
+                            if len(netloc_display) > 30: 
+                                netloc_display = netloc_display[:27] + "..."
+                            display_url_segment = f"{parsed_url.scheme}://{netloc_display}"
+                        except Exception: 
+                            display_url_segment = url_from_search[:30] + "..." if len(url_from_search) > 30 else url_from_search
+                        
+                        # Update line for current item before threaded fetch
+                        progress_text = f"[{i+1}/{num_total_results}] ({display_url_segment})"
+                        sys.stderr.write(f"\r{ANSI_EL}{base_fetch_msg_template} {progress_text}... {next(spinner_chars_local)}")
+                        sys.stderr.flush()
+                        
+                        q_fetch_search = queue.Queue()
+                        fetch_thread_search = threading.Thread(target=lambda func, u, q_res: q_res.put(func(u)), 
+                                                               args=(fetch_webpage, url_from_search, q_fetch_search))
+                        fetch_thread_search.start()
+
+                        webpage_content_from_search = None
+                        while fetch_thread_search.is_alive():
+                            sys.stderr.write(f"\r{ANSI_EL}{base_fetch_msg_template} {progress_text}... {next(spinner_chars_local)}")
+                            sys.stderr.flush()
+                            time.sleep(0.1)
+                            try:
+                                webpage_content_from_search = q_fetch_search.get_nowait()
+                                break 
+                            except queue.Empty:
+                                continue
+                        
+                        fetch_thread_search.join() 
+
+                        if not webpage_content_from_search: 
+                           try: 
+                               webpage_content_from_search = q_fetch_search.get_nowait()
+                           except queue.Empty: 
+                               webpage_content_from_search = None
+
+                        if webpage_content_from_search:
+                            successful_fetches += 1
+                            processed_lines.append(f"  --- Content from search result: {url_from_search} ---\n{webpage_content_from_search}\n  --- End of content for {url_from_search} ---")
+                        else:
+                            processed_lines.append(f"  --- Could not fetch content from search result: {url_from_search} ---")
+                    
+                    final_status_symbol = "✅" if successful_fetches == num_total_results else ("⚠️" if successful_fetches > 0 else "❌")
+                    final_summary_msg = f"\r{ANSI_EL}{base_fetch_msg_template}... {final_status_symbol} Done. ({successful_fetches}/{num_total_results} succeeded)\n"
+                    sys.stderr.write(final_summary_msg)
+                    sys.stderr.flush()
+
+                    processed_lines.append(f"--- End of search results for \"{query}\" ---")
+                # If search_results_urls was empty or None initially, this block is skipped, and the prior messages cover it.
+            else: # Regex for @search(...) did not match
                  processed_lines.append(line)
         else:
             processed_lines.append(line)
@@ -158,7 +327,7 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     if model_type == 'gemini' and messages:
         last_user_message = next((msg['content'] for msg in reversed(messages) if msg['role'] == 'user'), '')
         current_language = detect_language(last_user_message)
-        if len(messages) == 1:
+        if len(messages) == 1: 
             language_prompt = LANGUAGE_PROMPTS.get(current_language, LANGUAGE_PROMPTS['en'])
             messages[0]['content'] = f"{language_prompt}\n\n{messages[0]['content']}"
 
@@ -169,7 +338,7 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     REASONING_START_MARKER, REASONING_END_MARKER = "--- Reasoning Content ---", "--- End Reasoning ---"
     thinking_indicator_char = "🤔"
     len_thinking_indicator_display_cells = wcwidth.wcwidth(thinking_indicator_char)
-    if len_thinking_indicator_display_cells == -1: len_thinking_indicator_display_cells = 1
+    if len_thinking_indicator_display_cells == -1: len_thinking_indicator_display_cells = 1 
     thinking_indicator_on_screen = False
 
     def clear_thinking_indicator_if_on_screen():
@@ -189,7 +358,7 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     def start_spinner():
         nonlocal spinner_active, first_content_received_gemini
         if model_type == 'gemini' and first_content_received_gemini:
-            return # Do not start spinner for Gemini if content has already been received
+            return
 
         clear_thinking_indicator_if_on_screen()
         if not spinner_active:
@@ -197,14 +366,14 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     def update_spinner():
         nonlocal first_content_received_gemini
         if model_type == 'gemini' and first_content_received_gemini:
-            return # Do not update spinner for Gemini if content has already been received
+            return
 
         if spinner_active:
-            sys.stderr.write(f"\rThinking... {next(spinner_chars)}"); sys.stderr.flush()
+            sys.stderr.write(f"\r{ANSI_EL}Thinking... {next(spinner_chars)}"); sys.stderr.flush()
     def stop_spinner(success=True):
         nonlocal spinner_active, strip_leading_newline_next_write
         if spinner_active:
-            sys.stderr.write("\r" + " " * 20 + "\r" + f"Thinking... {'✅' if success else '❌'}\n")
+            sys.stderr.write(f"\r{ANSI_EL}Thinking... {'✅' if success else '❌'}\n") 
             spinner_active = False; sys.stderr.flush()
             if success: strip_leading_newline_next_write = True
     
@@ -221,92 +390,97 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                     chunk = data
                     if not chunk.choices: continue
                     delta = chunk.choices[0].delta
-                    if delta is None: continue
+                    if delta is None: continue 
+                    
                     reasoning_content, content = getattr(delta, 'reasoning_content', None), delta.content
                     
-                    # Stop spinner for Gemini on first actual content and set flag
                     if model_type == 'gemini' and content and not first_content_received_gemini and spinner_active:
                         stop_spinner() 
-                        first_content_received_gemini = True # Flag that Gemini content has started
+                        first_content_received_gemini = True
 
                     if reasoning_content:
                         if hide_reasoning:
-                            if not spinner_active: start_spinner() # start_spinner will check gemini flag
-                            update_spinner() # update_spinner will check gemini flag
+                            if not spinner_active: start_spinner()
+                            update_spinner()
                         else:
-                            if spinner_active: stop_spinner()
+                            if spinner_active: stop_spinner() 
                             if not is_reasoning_deepseek:
                                 clear_thinking_indicator_if_on_screen(); is_reasoning_deepseek = True
                                 sys.stdout.write(REASONING_START_MARKER + "\n" + ANSI_GREEN); sys.stdout.flush()
                                 strip_leading_newline_next_write = False
                             write_thinking_chunk_with_indicator(reasoning_content)
                         continue
-                    if content:
-                        if is_reasoning_deepseek:
+                    
+                    if content: 
+                        if is_reasoning_deepseek: 
                             clear_thinking_indicator_if_on_screen(); is_reasoning_deepseek = False
                             if not hide_reasoning:
                                 sys.stdout.write(ANSI_RESET + REASONING_END_MARKER + "\n"); sys.stdout.flush()
                                 strip_leading_newline_next_write = True
                         
-                        # General stop_spinner (non-Gemini or Gemini before first content)
                         if model_type != 'gemini' and spinner_active: 
                             stop_spinner()
-                        # For Gemini, it's already handled by the specific block above.
-                        # If spinner is active here for Gemini, it means first content hasn't arrived yet.
 
                         full_response_chunks.append(content); buffer += content
                         processed_chunk_for_history_this_delta, current_processing_buffer, buffer = '', buffer, ''
                         output_to_print_for_normal_content, temp_idx = "", 0
+                        
                         while temp_idx < len(current_processing_buffer):
                             if not in_think_block_tag:
                                 think_start_pos = current_processing_buffer.find('<think>', temp_idx)
-                                if think_start_pos == -1:
+                                if think_start_pos == -1: 
                                     clear_thinking_indicator_if_on_screen()
                                     normal_chunk = current_processing_buffer[temp_idx:]
                                     output_to_print_for_normal_content += normal_chunk
                                     processed_chunk_for_history_this_delta += normal_chunk
                                     temp_idx = len(current_processing_buffer)
-                                else:
+                                else: 
                                     clear_thinking_indicator_if_on_screen()
                                     normal_chunk_before_think = current_processing_buffer[temp_idx:think_start_pos]
                                     output_to_print_for_normal_content += normal_chunk_before_think
                                     processed_chunk_for_history_this_delta += normal_chunk_before_think
+                                    
                                     if output_to_print_for_normal_content:
                                         if strip_leading_newline_next_write:
                                             output_to_print_for_normal_content = output_to_print_for_normal_content.lstrip('\n')
                                             if output_to_print_for_normal_content: strip_leading_newline_next_write = False
                                         sys.stdout.write(output_to_print_for_normal_content); sys.stdout.flush()
                                         output_to_print_for_normal_content = ""
+
                                     temp_idx = think_start_pos + len('<think>'); in_think_block_tag = True
                                     if hide_reasoning:
-                                        if not spinner_active: start_spinner() # start_spinner will check gemini flag
-                                        update_spinner() # update_spinner will check gemini flag
-                                    else:
+                                        if not spinner_active: start_spinner()
+                                        update_spinner()
+                                    else: 
                                         if spinner_active: stop_spinner()
                                         sys.stdout.write(ANSI_GREEN); sys.stdout.flush()
-                            else: # Inside <think>
+                                        strip_leading_newline_next_write = False
+                            else: 
                                 think_end_pos = current_processing_buffer.find('</think>', temp_idx)
                                 if think_end_pos == -1:
                                     think_content_chunk = current_processing_buffer[temp_idx:]
                                     temp_idx = len(current_processing_buffer)
-                                    if hide_reasoning: update_spinner() # update_spinner will check gemini flag
+                                    if hide_reasoning: update_spinner()
                                     else: write_thinking_chunk_with_indicator(think_content_chunk)
-                                else:
+                                else: 
                                     think_content_chunk = current_processing_buffer[temp_idx:think_end_pos]
                                     temp_idx = think_end_pos + len('</think>'); in_think_block_tag = False
-                                    if hide_reasoning: update_spinner() # update_spinner will check gemini flag
+                                    if hide_reasoning: update_spinner() 
                                     else:
                                         clear_thinking_indicator_if_on_screen()
                                         sys.stdout.write(think_content_chunk + ANSI_RESET); sys.stdout.flush()
                                         strip_leading_newline_next_write = True
-                        if output_to_print_for_normal_content:
+                        
+                        if output_to_print_for_normal_content: 
                             clear_thinking_indicator_if_on_screen()
                             if strip_leading_newline_next_write:
                                 output_to_print_for_normal_content = output_to_print_for_normal_content.lstrip('\n')
                                 if output_to_print_for_normal_content: strip_leading_newline_next_write = False
                             sys.stdout.write(output_to_print_for_normal_content); sys.stdout.flush()
+
                         if processed_chunk_for_history_this_delta:
                             processed_response_chunks.append(processed_chunk_for_history_this_delta)
+
                 elif item_type == 'DONE':
                     clear_thinking_indicator_if_on_screen(); break
                 elif item_type == 'ERROR':
@@ -314,8 +488,8 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                     if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
                     sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
             except queue.Empty:
-                if spinner_active: update_spinner() # update_spinner will check gemini flag
-                if not worker_thread.is_alive():
+                if spinner_active: update_spinner()
+                if not worker_thread.is_alive(): 
                     clear_thinking_indicator_if_on_screen()
                     try:
                         item_type, data = q.get_nowait()
@@ -324,160 +498,149 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                             final_status_success = False; stop_spinner(success=False)
                             if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
                             sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
-                    except queue.Empty:
-                        if final_status_success: # Only show error if we thought it was successful before
+                    except queue.Empty: 
+                        if final_status_success: 
                             final_status_success = False; stop_spinner(success=False)
-                            sys.stderr.write("\nWorker thread finished unexpectedly.\n")
-                        return None # Error already handled or no error data from queue
-                    break # Break from while True if DONE or ERROR handled from get_nowait
+                            sys.stderr.write(f"\n{ANSI_EL}Worker thread finished unexpectedly.\n")
+                        return None 
+                    break 
+        
         clear_thinking_indicator_if_on_screen()
         if spinner_active: stop_spinner(success=final_status_success)
+        
         if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning:
             sys.stdout.write(ANSI_RESET); sys.stdout.flush()
+            if is_reasoning_deepseek: sys.stdout.write("\n" + REASONING_END_MARKER + "\n")
+            if in_think_block_tag: sys.stdout.write("\n</think>\n")
+
         processed_response = "".join(processed_response_chunks)
         return processed_response.lstrip('\n') if processed_response else ""
+
     except KeyboardInterrupt:
         final_status_success = False
-        # Ensure ANSI state is reset immediately on interrupt for both stdout and stderr
-        sys.stdout.write(ANSI_RESET)
-        sys.stderr.write(ANSI_RESET) # In case spinner/colors were on stderr
-        sys.stdout.flush()
-        sys.stderr.flush()
-
-        clear_thinking_indicator_if_on_screen()
-        stop_spinner(success=False)
-        
-        # Reset reasoning block colors if active and not hidden
+        sys.stdout.write(ANSI_RESET); sys.stderr.write(ANSI_RESET)
+        sys.stdout.flush(); sys.stderr.flush()
+        clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
         if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning:
-            sys.stdout.write(ANSI_RESET) # Ensures color reset on stdout
-            sys.stdout.flush()
-            sys.stderr.write('\n' + REASONING_END_MARKER + '\n') # Indicate end of reasoning on stderr
+            sys.stdout.write(ANSI_RESET); sys.stdout.flush()
+            sys.stderr.write(f"\n{REASONING_END_MARKER if is_reasoning_deepseek else '</think>'}\n(Interrupted)\n")
 
-        sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET) # User feedback
-        sys.stderr.flush()
-
-        # Try to flush stdin buffer if termios is available
+        sys.stderr.write(f"{ANSI_GREEN}\n^C Cancelled Stream!\n{ANSI_RESET}"); sys.stderr.flush()
         if TERMIOS_AVAILABLE:
             try:
-                # Check stdin is a TTY and its file descriptor is valid before flushing
                 if sys.stdin.isatty() and sys.stdin.fileno() >= 0:
                     termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
             except Exception as e_flush:
-                sys.stderr.write(f"Warn: Flushing stdin (TCIFLUSH) failed: {e_flush}\n")
-                sys.stderr.flush()
+                sys.stderr.write(f"Warn: Flushing stdin (TCIFLUSH) failed: {e_flush}\n"); sys.stderr.flush()
         return None
     except Exception as e:
         final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
         if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
-        sys.stdout.flush(); sys.stderr.write(f"\nAn unexpected error occurred in stream_response: {str(e)}\n")
+        sys.stdout.flush(); sys.stderr.write(f"\n{ANSI_EL}An unexpected error occurred in stream_response: {str(e)}\n")
         traceback.print_exc(file=sys.stderr); return None
     finally:
         clear_thinking_indicator_if_on_screen()
-        if 'spinner_active' in locals() and spinner_active :
-             sys.stderr.write("\r" + " " * (len("Thinking... ") + 5) + "\r"); sys.stderr.flush()
+        if 'spinner_active' in locals() and spinner_active : 
+             sys.stderr.write(f"\r{ANSI_EL}"); sys.stderr.flush() # Clear spinner line
         if 'worker_thread' in locals() and worker_thread.is_alive(): worker_thread.join(timeout=1.0)
+
 
 # --- Terminal Control Helper Functions (set_terminal_no_echoctl, restore_terminal_settings) ---
 def set_terminal_no_echoctl(fd: int) -> Optional[List]:
-    """Disables ECHOCTL terminal setting for the given file descriptor."""
     if not TERMIOS_AVAILABLE or not os.isatty(fd):
         return None
     try:
         old_settings = termios.tcgetattr(fd)
-        new_settings = list(old_settings) # Create a mutable copy
-        # lflag is at index 3. ECHOCTL is a bit in lflag.
+        new_settings = list(old_settings)
         new_settings[3] &= ~termios.ECHOCTL 
         termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
         return old_settings
     except termios.error as e:
-        sys.stderr.write(f"Warn: Failed to set terminal no ECHOCTL: {e}\n")
+        # sys.stderr.write(f"Warn: Failed to set terminal no ECHOCTL: {e}\n")
         return None
 
 def restore_terminal_settings(fd: int, old_settings: Optional[List]):
-    """Restores terminal settings for the given file descriptor."""
     if not TERMIOS_AVAILABLE or not os.isatty(fd) or old_settings is None:
         return
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     except termios.error as e:
-        sys.stderr.write(f"Warn: Failed to restore terminal settings: {e}\n")
+        pass # sys.stderr.write(f"Warn: Failed to restore terminal settings: {e}\n")
 
 # --- setup_tty_stdin and restore_stdin ---
 def setup_tty_stdin() -> Tuple[int, Optional[str]]:
     original_stdin_fd = -1
-    pipe_input = ""
-    readline_available = 'readline' in sys.modules
+    pipe_input_content = "" 
+    readline_available_flag = 'readline' in sys.modules
     try:
-        original_stdin_fd = os.dup(0) # Save current stdin
-        if not sys.stdin.isatty(): # If current stdin is not a TTY (e.g. piped input)
-            pipe_input = sys.stdin.read() # Read all piped input
-            sys.stdin.close() # Close the piped stdin
+        original_stdin_fd = os.dup(0) 
+        if not sys.stdin.isatty(): 
+            pipe_input_content = sys.stdin.read() 
+            sys.stdin.close() 
             try:
-                # Try to open /dev/tty as the new stdin
                 new_stdin_fd = os.open('/dev/tty', os.O_RDONLY)
-                os.dup2(new_stdin_fd, 0) # Duplicate /dev/tty to fd 0 (stdin)
-                os.close(new_stdin_fd) # Close original /dev/tty fd
-                sys.stdin = open(0, 'r', closefd=False) # Re-open sys.stdin from fd 0
+                os.dup2(new_stdin_fd, 0) 
+                os.close(new_stdin_fd) 
+                sys.stdin = open(0, 'r', closefd=False) 
             except OSError as e:
                 sys.stderr.write(f"Warning: Could not switch to TTY for interactive input: {e}\n")
                 sys.stderr.write("Fallback to original (non-TTY) stdin. Interactive mode might be limited.\n")
-                # Fallback: restore original stdin if TTY opening failed
                 try:
                     os.dup2(original_stdin_fd, 0)
                     sys.stdin = open(0, 'r', closefd=False)
                 except OSError as restore_e:
                      sys.stderr.write(f"Critical: Could not restore original stdin after TTY switch failure: {restore_e}\n")
         
-        # Setup readline if stdin is now a TTY and readline is available
-        if sys.stdin.isatty() and readline_available:
+        if sys.stdin.isatty() and readline_available_flag:
             try:
                 readline.parse_and_bind('tab: complete')
                 history_file = os.path.join(os.path.expanduser("~"), ".ag_history")
                 try: readline.read_history_file(history_file)
                 except FileNotFoundError: pass
-                except Exception as hist_e: sys.stderr.write(f"Warn: Read history failed: {hist_e}\n")
+                except Exception: pass # Ignore hist_e
                 import atexit
                 def save_history():
                     try: readline.write_history_file(history_file)
-                    except Exception as save_hist_e: sys.stderr.write(f"Warn: Save history failed: {save_hist_e}\n")
+                    except Exception: pass # Ignore save_hist_e
                 atexit.register(save_history)
-            except Exception as readline_e: sys.stderr.write(f"Warn: Readline setup failed: {readline_e}\n")
-        elif sys.stdin.isatty() and not readline_available:
-            sys.stderr.write("Warn: readline unavailable. Editing features limited for Ctrl+C handling during input.\n")
+            except Exception: pass # Ignore readline_e
+        elif sys.stdin.isatty() and not readline_available_flag:
+            # sys.stderr.write("Warn: readline unavailable. Editing features limited for Ctrl+C handling during input.\n")
+            pass
             
     except Exception as e:
         sys.stderr.write(f"Error during TTY/stdin setup: {e}\n")
-        # Ensure original_stdin_fd is closed if it was dup'd and not 0
         if original_stdin_fd != -1 and original_stdin_fd != 0:
             try: os.close(original_stdin_fd)
             except OSError: pass 
-            original_stdin_fd = -1 # Mark as closed or invalid for restore_stdin
+            original_stdin_fd = -1 
             
-    return original_stdin_fd, pipe_input
+    return original_stdin_fd, pipe_input_content
 
 def restore_stdin(original_stdin_fd: int):
     try:
-        if original_stdin_fd != -1: # If original_stdin_fd was successfully saved
+        if original_stdin_fd != -1: 
             current_stdin_fd = -1
             try:
                 if sys.stdin and not sys.stdin.closed:
                     current_stdin_fd = sys.stdin.fileno()
                     sys.stdin.close()
-            except Exception: # Ignore errors if sys.stdin is already weird
+            except Exception: 
                 pass
 
             try:
-                os.dup2(original_stdin_fd, 0) # Restore original stdin fd to 0
-                sys.stdin = open(0, 'r', closefd=False) # Re-open sys.stdin from new fd 0
-            except Exception as e_dup: 
-                sys.stderr.write(f"Warn: Restore stdin using dup2 failed: {e_dup}\n")
+                os.dup2(original_stdin_fd, 0) 
+                sys.stdin = open(0, 'r', closefd=False) 
+            except Exception: # e_dup
+                # sys.stderr.write(f"Warn: Restore stdin using dup2 failed: {e_dup}\n")
+                pass
             finally:
-                # Close the saved original_stdin_fd only if it's not fd 0 itself
-                if original_stdin_fd != 0:
+                if original_stdin_fd != 0: # Only close if it's not the standard 0
                     try: os.close(original_stdin_fd)
                     except OSError: pass
-    except Exception as e: 
-        sys.stderr.write(f"Error during stdin restoration: {e}\n")
+    except Exception: # e
+        # sys.stderr.write(f"Error during stdin restoration: {e}\n")
+        pass
 
 # --- Modified main Function ---
 def main():
@@ -510,17 +673,18 @@ def main():
         sys.exit(f"Error initializing OpenAI client: {e}")
 
     messages: List[Dict[str, str]] = []
-    original_stdin_fd, pipe_input = setup_tty_stdin()
-    readline_available = 'readline' in sys.modules and hasattr(readline, 'get_line_buffer')
+    original_stdin_fd, initial_pipe_input_content = setup_tty_stdin()
+    is_readline_available_in_main = 'readline' in sys.modules and hasattr(readline, 'get_line_buffer')
     
     original_termios_settings = None
-    # After setup_tty_stdin, sys.stdin should be the TTY if successful
     if TERMIOS_AVAILABLE and sys.stdin.isatty():
         try:
-            fd = sys.stdin.fileno()
-            original_termios_settings = set_terminal_no_echoctl(fd)
-        except Exception as e_set_termios: # Catch if fileno() or isatty() fails for some reason
-            sys.stderr.write(f"Warn: Could not get/set termios settings for stdin: {e_set_termios}\n")
+            fd_val = sys.stdin.fileno()
+            if fd_val >=0: # Ensure valid file descriptor
+                 original_termios_settings = set_terminal_no_echoctl(fd_val)
+        except Exception: # e_set_termios
+            # sys.stderr.write(f"Warn: Could not get/set termios settings for stdin: {e_set_termios}\n")
+            pass
 
 
     grep_prompt_template = """I want you to act strictly as a Linux `grep` command filter.
@@ -536,134 +700,143 @@ Input Text:
 {input_text}
 Matching Lines Only:"""
     
+    has_used_initial_pipe_input = False
+
     try: 
-        if args.raw_text: # Single-shot mode
+        if args.raw_text: 
             user_content = args.raw_text
-            if pipe_input:
-                user_content = f"Context from piped input:\n{pipe_input.strip()}\n\nUser Query: {user_content}"
+            if initial_pipe_input_content: 
+                user_content = f"Context from piped input:\n{initial_pipe_input_content.strip()}\n\nUser Query: {user_content}"
+            
+            processed_user_content = process_input_directives(user_content)
+
             if args.grep_enabled:
-                if not pipe_input: sys.exit("Error: --grep-enabled requires piped input for single-shot mode.")
-                messages = [{"role": "user", "content": grep_prompt_template.format(pattern=args.raw_text, input_text=pipe_input)}]
+                if not initial_pipe_input_content:
+                     sys.exit("Error: --grep-enabled requires piped input when providing a direct question (raw_text).")
+                messages = [{"role": "user", "content": grep_prompt_template.format(pattern=args.raw_text, input_text=initial_pipe_input_content)}]
             else:
-                messages.append({"role": "user", "content": process_input_directives(user_content)})
+                messages = [{"role": "user", "content": processed_user_content}]
+
             response_content = stream_response(client, args.model, args.model_type, messages, args.max_tokens, freq_penalty, pres_penalty, args.hide_reasoning)
             if response_content is not None and not response_content.endswith('\n'): sys.stdout.write("\n")
             sys.stdout.flush(); sys.exit(0)
 
-        # Interactive mode
-        sys.stderr.write("Entering interactive mode. Use Ctrl+D to submit, Ctrl+C to interact/exit.\n")
-        initial_pipe_input = pipe_input 
-
-        while True: # Outer loop for each full user query/command
-            sys.stderr.write("\n💥 Ask (Ctrl+D Submit, !cmd, @file, @url):\n")
-            lines_for_current_prompt = []
+        sys.stderr.write("Entering interactive mode. Use Ctrl+D to submit, !cmd, @file, @url, @search:\n")
+        
+        while True:
+            sys.stderr.write(f"\n{ANSI_RESET}💥 Ask (Ctrl+D Submit, !cmd, @file, @url, @search):\n")
             
+            current_prompt_accumulator: List[str] = [] 
+
+            if initial_pipe_input_content and not has_used_initial_pipe_input:
+                current_prompt_accumulator.append(f"Context from initial piped input:\n{initial_pipe_input_content.strip()}")
+
             while True: 
-                prompt_char = "> " if not lines_for_current_prompt else "  "
-                try:
-                    current_line_text = input(prompt_char)
-                    lines_for_current_prompt.append(current_line_text)
+                current_accumulated_str_for_prompt_char = '\n'.join(current_prompt_accumulator).strip()
+                prompt_char = "  " if current_accumulated_str_for_prompt_char else "> "
                 
+                try:
+                    user_line_input = input(prompt_char)
+                    stripped_user_line = user_line_input.strip()
+
+                    if stripped_user_line.startswith('!'):
+                        command_str_from_input = stripped_user_line[1:].strip()
+                        
+                        if command_str_from_input.lower() == 'clear':
+                            messages.clear()
+                            current_prompt_accumulator.clear() 
+                            sys.stdout.write(ANSI_CLEAR_SCREEN); sys.stdout.flush()
+                            sys.stderr.write("Conversation history and current input cleared.\n")
+                            break 
+                        elif command_str_from_input: 
+                            sys.stderr.write(f"\nExecuting: `{command_str_from_input}`\n---\n")
+                            command_output_str = execute_command(command_str_from_input)
+                            sys.stderr.write(command_output_str)
+                            if not command_output_str.endswith('\n'): sys.stderr.write("\n")
+                            sys.stderr.write("---\n"); sys.stderr.flush()
+                            
+                            formatted_cmd_output_for_prompt = (
+                                f"--- User executed command `{command_str_from_input}` "
+                                f"which produced the following output ---\n{command_output_str.strip()}\n"
+                                f"--- End of command output ---"
+                            )
+                            current_prompt_accumulator.append(formatted_cmd_output_for_prompt)
+                            sys.stderr.write("Command output added to current prompt. Continue typing or Ctrl+D to submit.\n")
+                        else: 
+                            current_prompt_accumulator.append(user_line_input)
+                    else: 
+                        current_prompt_accumulator.append(user_line_input)
+
                 except EOFError: 
-                    sys.stderr.write(ANSI_GREEN + "^D EOF!\n" + ANSI_RESET) 
+                    sys.stderr.write(ANSI_GREEN + "^D EOF!\n" + ANSI_RESET)
                     break 
 
                 except KeyboardInterrupt: 
-                    sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET); # Script's own cancel message
+                    sys.stderr.write(ANSI_GREEN + "\n^C Cancelled!" + ANSI_RESET)
                     
-                    prompt_lines_has_content = False
-                    if readline_available:
+                    readline_buffer_non_empty = False
+                    if is_readline_available_in_main:
                         try:
-                            if readline.get_line_buffer() or bool(lines_for_current_prompt): 
-                                 prompt_lines_has_content = True
-                        except Exception:
-                            prompt_lines_has_content = False
+                            if readline.get_line_buffer(): readline_buffer_non_empty = True
+                        except Exception: pass
+                    
+                    current_input_has_content = bool(''.join(current_prompt_accumulator).strip()) or readline_buffer_non_empty
 
-                    if prompt_lines_has_content:
-                        lines_for_current_prompt.clear()
-                        # readline itself handles clearing the visual line on SIGINT if it's managing input.
-                        # If ECHOCTL is off, no terminal-generated ^C should appear here.
-                        continue 
-                    else:
-                        raise # Caught by outer try/except KeyboardInterrupt in main
+                    if current_input_has_content:
+                        current_prompt_accumulator.clear()
+                        sys.stderr.write("\nCurrent input cleared due to ^C. Enter new input or Ctrl+D/Ctrl+C again.\n")
+                    else: 
+                        # Before re-raising, ensure any ANSI codes are reset for stderr
+                        sys.stderr.write(ANSI_RESET)
+                        sys.stderr.flush()
+                        raise 
             
-            user_input = '\n'.join(lines_for_current_prompt).strip()
+            final_prompt_str_for_llm = '\n'.join(current_prompt_accumulator).strip()
             
-            if initial_pipe_input:
-                user_input = f"Context from piped input:\n{initial_pipe_input.strip()}\n\nUser Query: {user_input}"
-                initial_pipe_input = "" 
-            
-            if not user_input: 
-                continue
-
-            command_executed_this_turn, clear_command_issued = False, False
-            user_input_for_llm = user_input 
-            first_line_stripped = user_input.splitlines()[0].strip() if user_input else ""
-
-            if first_line_stripped.startswith('!'):
-                command_to_execute = first_line_stripped[1:].strip()
-                if command_to_execute.lower() == 'clear':
-                    messages.clear(); sys.stdout.write(ANSI_CLEAR_SCREEN); sys.stdout.flush()
-                    sys.stderr.write("Conversation history cleared.\n")
-                    clear_command_issued, command_executed_this_turn = True, True
-                elif command_to_execute:
-                    sys.stderr.write(f"\nExecuting: `{command_to_execute}`\n---\n")
-                    output_from_command = execute_command(command_to_execute)
-                    sys.stdout.write(output_from_command)
-                    if not output_from_command.endswith('\n'): sys.stdout.write("\n")
-                    sys.stdout.write("---\n"); sys.stdout.flush()
-                    command_executed_this_turn, user_input_for_llm = True, ""
-            
-            if clear_command_issued or (command_executed_this_turn and user_input_for_llm == ""):
+            if not final_prompt_str_for_llm: 
                 continue 
-            if not user_input_for_llm.strip():
-                continue
 
-            processed_input_for_llm = process_input_directives(user_input_for_llm)
+            if initial_pipe_input_content and not has_used_initial_pipe_input and \
+               any(initial_pipe_input_content.strip() in part for part in current_prompt_accumulator):
+                has_used_initial_pipe_input = True
+            
+            processed_input_for_llm = process_input_directives(final_prompt_str_for_llm)
             messages.append({"role": "user", "content": processed_input_for_llm})
-            sys.stdout.write("💡:\n"); sys.stdout.flush()
+            
+            sys.stdout.write(f"{ANSI_RESET}💡:\n"); sys.stdout.flush() # Reset ANSI before prompt
             response_content = stream_response(client, args.model, args.model_type, messages, args.max_tokens, freq_penalty, pres_penalty, args.hide_reasoning)
+            
             if response_content is not None:
                 messages.append({"role": "assistant", "content": response_content})
-                if not response_content.endswith('\n') and response_content != "": sys.stdout.write("\n")
+                if response_content and not response_content.endswith('\n'): 
+                    sys.stdout.write("\n")
                 sys.stdout.flush()
+            sys.stdout.write(ANSI_RESET) # Ensure reset after response
+            sys.stdout.flush()
+
 
     except KeyboardInterrupt: 
-        # This catches Ctrl+C if it was raised from the inner input loop (empty prompt)
-        # or if stream_response re-raised it (which it currently doesn't, it returns None)
-        # The main purpose is to allow graceful exit.
-        # The "Cancelled!" message for this specific case (empty prompt Ctrl+C)
-        # is already printed in the inner loop's exception handler.
-        # Ensure a newline if ^C was pressed so term prompt isn't on same line.
-        sys.stderr.write("\n") 
+        # sys.stderr.write(f"\n{ANSI_GREEN}Exiting due to ^C.{ANSI_RESET}\n") 
         pass 
     except Exception as e:
-        sys.stderr.write(f"\nAn unexpected error occurred in main loop: {e}\n")
+        sys.stderr.write(f"\n{ANSI_RESET}An unexpected error occurred in main loop: {e}\n")
         traceback.print_exc(file=sys.stderr)
     finally:
-        # Restore terminal settings first, before stdin FD is potentially changed by restore_stdin
         if TERMIOS_AVAILABLE and original_termios_settings is not None:
-            current_stdin_is_tty = False
-            current_stdin_fd = -1
+            current_stdin_is_tty = False; current_stdin_fd_val = -1
             try:
                 if sys.stdin and not sys.stdin.closed:
-                    current_stdin_fd = sys.stdin.fileno()
-                    if os.isatty(current_stdin_fd):
-                        current_stdin_is_tty = True
-            except Exception: # stdin might be in a weird state
-                 pass 
-            
-            if current_stdin_is_tty:
-                restore_terminal_settings(current_stdin_fd, original_termios_settings)
-            # else: # Log if settings couldn't be restored (optional)
-                # sys.stderr.write("Warn: Did not restore termios settings (stdin not a TTY or inaccessible at exit).\n")
+                    current_stdin_fd_val = sys.stdin.fileno()
+                    if current_stdin_fd_val >=0 and os.isatty(current_stdin_fd_val): current_stdin_is_tty = True
+            except Exception: pass 
+            if current_stdin_is_tty: restore_terminal_settings(current_stdin_fd_val, original_termios_settings)
         
         restore_stdin(original_stdin_fd)
-        # Final newline to ensure shell prompt is clean
-        sys.stderr.write(ANSI_RESET) # Ensure colors are reset before exiting.
-        sys.stderr.flush()
+        sys.stderr.write(ANSI_RESET); sys.stdout.write(ANSI_RESET) # Reset both at the very end
+        sys.stderr.flush(); sys.stdout.flush()
 
 
 if __name__ == '__main__':
     main()
+
 
