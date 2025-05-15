@@ -17,6 +17,7 @@ from openai import OpenAI, APIError
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse
+import glob # Added for file path completion
 
 try:
     from googlesearch import search as google_search_func # Alias to avoid name collision
@@ -100,16 +101,18 @@ def process_input_directives(input_str: str) -> str:
             if match:
                 filename = match.group(1).strip()
                 try:
-                    with open(filename, 'r', encoding='utf-8') as f:
-                        processed_lines.append(f"--- Content of {filename} ---\n{f.read()}\n--- End of {filename} ---")
+                    # Expand ~ and environment variables in filename
+                    expanded_filename = os.path.expanduser(os.path.expandvars(filename))
+                    with open(expanded_filename, 'r', encoding='utf-8') as f:
+                        processed_lines.append(f"--- Content of {filename} (resolved to {expanded_filename}) ---\n{f.read()}\n--- End of {filename} ---")
                 except FileNotFoundError:
-                    sys.stderr.write(f"Error: File not found: {filename}\n")
+                    sys.stderr.write(f"Error: File not found: {filename} (resolved to {expanded_filename if 'expanded_filename' in locals() else filename})\n")
                 except IOError as e:
                     sys.stderr.write(f"Error reading {filename}: {str(e)}\n")
                 except Exception as e:
                      sys.stderr.write(f"Unexpected error processing file {filename}: {str(e)}\n")
             else:
-                 processed_lines.append(line) 
+                 processed_lines.append(line)
         elif stripped_line.startswith('@url'):
             match = re.match(r'@url\(([^)]+)\)', stripped_line)
             if match:
@@ -123,7 +126,7 @@ def process_input_directives(input_str: str) -> str:
 
                 sys.stderr.write(f"Fetching content from URL: {display_url_at_url} ... ")
                 sys.stderr.flush()
-                
+
                 content_fetched_url = False
                 q_url = queue.Queue()
                 fetch_thread_url = threading.Thread(target=lambda func, u, q_res: q_res.put(func(u)), args=(fetch_webpage, url, q_url))
@@ -136,18 +139,18 @@ def process_input_directives(input_str: str) -> str:
                     time.sleep(0.1)
                     try:
                         webpage_content_result = q_url.get_nowait()
-                        content_fetched_url = True 
+                        content_fetched_url = True
                         break
                     except queue.Empty:
                         continue
-                
-                fetch_thread_url.join() 
-                
-                if not content_fetched_url: 
-                    try: 
-                        webpage_content_result = q_url.get_nowait() 
-                    except queue.Empty: 
-                        webpage_content_result = None 
+
+                fetch_thread_url.join()
+
+                if not content_fetched_url:
+                    try:
+                        webpage_content_result = q_url.get_nowait()
+                    except queue.Empty:
+                        webpage_content_result = None
 
                 if webpage_content_result:
                     sys.stderr.write(f"\r{ANSI_EL}Fetching content from URL: {display_url_at_url} ... ✅ Done.\n")
@@ -156,21 +159,21 @@ def process_input_directives(input_str: str) -> str:
                     sys.stderr.write(f"\r{ANSI_EL}Fetching content from URL: {display_url_at_url} ... ❌ Failed.\n")
                 sys.stderr.flush()
             else:
-                 processed_lines.append(line) 
+                 processed_lines.append(line)
         elif stripped_line.startswith('@search'):
             if google_search_func is None:
                 sys.stderr.write(f"{ANSI_EL}Error: The 'googlesearch-python' library is not installed. @search functionality is unavailable.\n"
                                  f"{ANSI_EL}Please install it using: pip install googlesearch-python\n")
-                processed_lines.append(line) 
+                processed_lines.append(line)
                 continue
 
             match = re.match(r'@search\(([^)]+)\)', stripped_line)
             if match:
                 query = match.group(1).strip()
-                sys.stderr.write(f"Searching for '{query}'...  ") 
+                sys.stderr.write(f"Searching for '{query}'...  ")
                 sys.stderr.flush()
-                
-                search_results_urls = None 
+
+                search_results_urls = None
                 search_error_msg = None
 
                 def perform_search_in_thread(q_search_results, search_query_param):
@@ -180,12 +183,12 @@ def process_input_directives(input_str: str) -> str:
                             search_query_param,
                             num_results=DEFAULT_SEARCH_RESULTS_LIMIT,
                             lang='en',
-                            sleep_interval=DEFAULT_SEARCH_SLEEP_INTERVAL 
+                            sleep_interval=DEFAULT_SEARCH_SLEEP_INTERVAL
                         ))
                         q_search_results.put(results)
                     except Exception as e:
-                        search_error_msg = str(e) 
-                        q_search_results.put(None) 
+                        search_error_msg = str(e)
+                        q_search_results.put(None)
 
                 search_q = queue.Queue()
                 search_thread = threading.Thread(target=perform_search_in_thread, args=(search_q, query))
@@ -195,51 +198,51 @@ def process_input_directives(input_str: str) -> str:
                     sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... {next(spinner_chars_local)}")
                     sys.stderr.flush()
                     time.sleep(0.1)
-                
-                search_thread.join() 
-                
+
+                search_thread.join()
+
                 try:
-                    search_results_urls = search_q.get_nowait() 
-                except queue.Empty: 
-                    if not search_error_msg: 
+                    search_results_urls = search_q.get_nowait()
+                except queue.Empty:
+                    if not search_error_msg:
                         search_error_msg = "Search thread did not return a result."
 
-                if search_error_msg: 
+                if search_error_msg:
                     sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... ❌ Error: {search_error_msg}\n")
-                elif search_results_urls is None: 
+                elif search_results_urls is None:
                     sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... ❌ An unspecified error occurred during search.\n")
-                elif not search_results_urls: 
+                elif not search_results_urls:
                     sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... No results found.\n")
-                else: 
+                else:
                     sys.stderr.write(f"\r{ANSI_EL}Searching for '{query}'... ✅ Found {len(search_results_urls)} results.\n")
                 sys.stderr.flush()
 
-                if search_results_urls: 
+                if search_results_urls:
                     num_total_results = len(search_results_urls)
                     processed_lines.append(f"--- Search results for query: \"{query}\" (top {num_total_results}) ---")
-                    
+
                     base_fetch_msg_template = f"Fetching content from {num_total_results} result(s)"
                     sys.stderr.write(f"{base_fetch_msg_template} [0/{num_total_results}]...")
                     sys.stderr.flush()
-                    
+
                     successful_fetches = 0
 
                     for i, url_from_search in enumerate(search_results_urls):
                         try:
                             parsed_url = urlparse(url_from_search)
                             netloc_display = parsed_url.netloc
-                            if len(netloc_display) > 30: 
+                            if len(netloc_display) > 30:
                                 netloc_display = netloc_display[:27] + "..."
                             display_url_segment = f"{parsed_url.scheme}://{netloc_display}"
-                        except Exception: 
+                        except Exception:
                             display_url_segment = url_from_search[:30] + "..." if len(url_from_search) > 30 else url_from_search
-                        
+
                         progress_text = f"[{i+1}/{num_total_results}] ({display_url_segment})"
                         sys.stderr.write(f"\r{ANSI_EL}{base_fetch_msg_template} {progress_text}... {next(spinner_chars_local)}")
                         sys.stderr.flush()
-                        
+
                         q_fetch_search = queue.Queue()
-                        fetch_thread_search = threading.Thread(target=lambda func, u, q_res: q_res.put(func(u)), 
+                        fetch_thread_search = threading.Thread(target=lambda func, u, q_res: q_res.put(func(u)),
                                                                args=(fetch_webpage, url_from_search, q_fetch_search))
                         fetch_thread_search.start()
 
@@ -252,32 +255,32 @@ def process_input_directives(input_str: str) -> str:
                             try:
                                 webpage_content_from_search = q_fetch_search.get_nowait()
                                 content_fetched_search = True
-                                break 
+                                break
                             except queue.Empty:
                                 continue
-                        
-                        fetch_thread_search.join() 
 
-                        if not content_fetched_search: 
-                           try: 
-                               webpage_content_from_search = q_fetch_search.get_nowait() 
-                           except queue.Empty: 
-                               webpage_content_from_search = None 
+                        fetch_thread_search.join()
+
+                        if not content_fetched_search:
+                           try:
+                               webpage_content_from_search = q_fetch_search.get_nowait()
+                           except queue.Empty:
+                               webpage_content_from_search = None
 
                         if webpage_content_from_search:
                             successful_fetches += 1
                             processed_lines.append(f"  --- Content from search result: {url_from_search} ---\n{webpage_content_from_search}\n  --- End of content for {url_from_search} ---")
                         else:
                             processed_lines.append(f"  --- Could not fetch content from search result: {url_from_search} ---")
-                    
+
                     final_status_symbol = "✅" if successful_fetches == num_total_results else ("⚠️" if successful_fetches > 0 else "❌")
                     final_summary_msg = f"\r{ANSI_EL}{base_fetch_msg_template}... {final_status_symbol} Done. ({successful_fetches}/{num_total_results} succeeded)\n"
                     sys.stderr.write(final_summary_msg)
                     sys.stderr.flush()
 
                     processed_lines.append(f"--- End of search results for \"{query}\" ---")
-            else: 
-                 processed_lines.append(line) 
+            else:
+                 processed_lines.append(line)
         else:
             processed_lines.append(line)
     return '\n'.join(processed_lines)
@@ -302,7 +305,7 @@ def _api_worker(
         }
         if frequency_penalty is not None: params["frequency_penalty"] = frequency_penalty
         if presence_penalty is not None: params["presence_penalty"] = presence_penalty
-        
+
         stream = client.chat.completions.create(**params)
         for chunk in stream:
             q.put(('CHUNK', chunk))
@@ -316,7 +319,7 @@ def _api_worker(
 def stream_response(client: OpenAI, model: str, model_type: str, messages: List[Dict[str, str]],
                     max_tokens: int, frequency_penalty: Optional[float],
                     presence_penalty: Optional[float], hide_reasoning: bool) -> Optional[str]:
-    
+
     def detect_language(text: str) -> str:
         if re.search(r'[\u4e00-\u9fff]', text): return 'zh'
         return 'en'
@@ -329,7 +332,7 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     if model_type == 'gemini' and messages:
         last_user_message = next((msg['content'] for msg in reversed(messages) if msg['role'] == 'user'), '')
         current_language = detect_language(last_user_message)
-        if len(messages) == 1: 
+        if len(messages) == 1:
             language_prompt = LANGUAGE_PROMPTS.get(current_language, LANGUAGE_PROMPTS['en'])
             if messages[-1]['role'] == 'user':
                  messages[-1]['content'] = f"{language_prompt}\n\n{messages[-1]['content']}"
@@ -339,10 +342,10 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     spinner_chars = itertools.cycle(['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'])
     first_content_received_gemini, strip_leading_newline_next_write = False, False
     REASONING_START_MARKER, REASONING_END_MARKER = "--- Reasoning Content ---", "--- End Reasoning ---"
-    
+
     thinking_indicator_char = "🤔"
     len_thinking_indicator_display_cells = wcwidth.wcwidth(thinking_indicator_char)
-    if len_thinking_indicator_display_cells == -1: len_thinking_indicator_display_cells = 1 
+    if len_thinking_indicator_display_cells == -1: len_thinking_indicator_display_cells = 1
     thinking_indicator_on_screen = False
 
     def clear_thinking_indicator_if_on_screen():
@@ -360,12 +363,12 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
         sys.stdout.write(text_chunk + thinking_indicator_char)
         sys.stdout.flush()
         thinking_indicator_on_screen = True
-    
+
     def start_spinner():
         nonlocal spinner_active, first_content_received_gemini
         if model_type == 'gemini' and first_content_received_gemini:
             return
-        clear_thinking_indicator_if_on_screen() 
+        clear_thinking_indicator_if_on_screen()
         if not spinner_active:
             sys.stderr.write("Thinking... "); spinner_active = True; sys.stderr.flush()
 
@@ -379,121 +382,121 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     def stop_spinner(success=True):
         nonlocal spinner_active, strip_leading_newline_next_write
         if spinner_active:
-            sys.stderr.write(f"\r{ANSI_EL}Thinking... {'✅' if success else '❌'}\n") 
+            sys.stderr.write(f"\r{ANSI_EL}Thinking... {'✅' if success else '❌'}\n")
             spinner_active = False; sys.stderr.flush()
             if success: strip_leading_newline_next_write = True
-    
+
     q = queue.Queue()
     worker_thread = threading.Thread(target=_api_worker, args=(q, client, model, messages, max_tokens, frequency_penalty, presence_penalty), daemon=True)
     worker_thread.start()
 
-    final_status_success = True 
+    final_status_success = True
     try:
-        if hide_reasoning: start_spinner() 
+        if hide_reasoning: start_spinner()
 
         while True:
             try:
-                item_type, data = q.get(timeout=0.1) 
-                
+                item_type, data = q.get(timeout=0.1)
+
                 if item_type == 'CHUNK':
                     chunk = data
-                    if not chunk.choices: continue 
+                    if not chunk.choices: continue
                     delta = chunk.choices[0].delta
-                    if delta is None: continue 
-                    
+                    if delta is None: continue
+
                     reasoning_content = getattr(delta, 'reasoning_content', None)
                     content = delta.content
-                    
+
                     if model_type == 'gemini' and content and not first_content_received_gemini and spinner_active:
-                        stop_spinner() 
+                        stop_spinner()
                         first_content_received_gemini = True
 
                     if reasoning_content:
                         if hide_reasoning:
-                            if not spinner_active: start_spinner() 
+                            if not spinner_active: start_spinner()
                             update_spinner()
                         else:
-                            if spinner_active: stop_spinner() 
-                            if not is_reasoning_deepseek: 
-                                clear_thinking_indicator_if_on_screen() 
+                            if spinner_active: stop_spinner()
+                            if not is_reasoning_deepseek:
+                                clear_thinking_indicator_if_on_screen()
                                 is_reasoning_deepseek = True
                                 sys.stdout.write(REASONING_START_MARKER + "\n" + ANSI_GREEN); sys.stdout.flush()
-                                strip_leading_newline_next_write = False 
+                                strip_leading_newline_next_write = False
                             write_thinking_chunk_with_indicator(reasoning_content)
-                        continue 
-                    
-                    if content: 
-                        if is_reasoning_deepseek: 
-                            clear_thinking_indicator_if_on_screen() 
-                            is_reasoning_deepseek = False 
+                        continue
+
+                    if content:
+                        if is_reasoning_deepseek:
+                            clear_thinking_indicator_if_on_screen()
+                            is_reasoning_deepseek = False
                             if not hide_reasoning:
                                 sys.stdout.write(ANSI_RESET + REASONING_END_MARKER + "\n"); sys.stdout.flush()
-                                strip_leading_newline_next_write = True 
-                        
-                        if model_type != 'gemini' and spinner_active: 
+                                strip_leading_newline_next_write = True
+
+                        if model_type != 'gemini' and spinner_active:
                             stop_spinner()
 
-                        full_response_chunks.append(content) 
-                        buffer += content 
+                        full_response_chunks.append(content)
+                        buffer += content
                         processed_chunk_for_history_this_delta = ''
                         output_to_print_for_normal_content = ""
-                        
-                        current_processing_buffer = buffer 
-                        buffer = '' 
+
+                        current_processing_buffer = buffer
+                        buffer = ''
 
                         temp_idx = 0
                         while temp_idx < len(current_processing_buffer):
-                            if not in_think_block_tag: 
+                            if not in_think_block_tag:
                                 think_start_pos = current_processing_buffer.find('<think>', temp_idx)
-                                if think_start_pos == -1: 
-                                    clear_thinking_indicator_if_on_screen() 
+                                if think_start_pos == -1:
+                                    clear_thinking_indicator_if_on_screen()
                                     normal_chunk = current_processing_buffer[temp_idx:]
                                     output_to_print_for_normal_content += normal_chunk
                                     processed_chunk_for_history_this_delta += normal_chunk
-                                    temp_idx = len(current_processing_buffer) 
-                                else: 
-                                    clear_thinking_indicator_if_on_screen() 
+                                    temp_idx = len(current_processing_buffer)
+                                else:
+                                    clear_thinking_indicator_if_on_screen()
                                     normal_chunk_before_think = current_processing_buffer[temp_idx:think_start_pos]
                                     output_to_print_for_normal_content += normal_chunk_before_think
                                     processed_chunk_for_history_this_delta += normal_chunk_before_think
-                                    
+
                                     if output_to_print_for_normal_content:
                                         if strip_leading_newline_next_write:
                                             output_to_print_for_normal_content = output_to_print_for_normal_content.lstrip('\n')
-                                            if output_to_print_for_normal_content: strip_leading_newline_next_write = False 
+                                            if output_to_print_for_normal_content: strip_leading_newline_next_write = False
                                         sys.stdout.write(output_to_print_for_normal_content); sys.stdout.flush()
-                                        output_to_print_for_normal_content = "" 
+                                        output_to_print_for_normal_content = ""
 
                                     temp_idx = think_start_pos + len('<think>')
-                                    in_think_block_tag = True 
+                                    in_think_block_tag = True
                                     if hide_reasoning:
                                         if not spinner_active: start_spinner()
                                         update_spinner()
-                                    else: 
-                                        if spinner_active: stop_spinner() 
-                                        sys.stdout.write(ANSI_GREEN); sys.stdout.flush() 
+                                    else:
+                                        if spinner_active: stop_spinner()
+                                        sys.stdout.write(ANSI_GREEN); sys.stdout.flush()
                                         strip_leading_newline_next_write = False
-                            else: 
+                            else:
                                 think_end_pos = current_processing_buffer.find('</think>', temp_idx)
-                                if think_end_pos == -1: 
+                                if think_end_pos == -1:
                                     think_content_chunk = current_processing_buffer[temp_idx:]
-                                    temp_idx = len(current_processing_buffer) 
+                                    temp_idx = len(current_processing_buffer)
                                     if hide_reasoning: update_spinner()
                                     else: write_thinking_chunk_with_indicator(think_content_chunk)
-                                else: 
+                                else:
                                     think_content_chunk = current_processing_buffer[temp_idx:think_end_pos]
-                                    if not hide_reasoning: 
-                                        write_thinking_chunk_with_indicator(think_content_chunk) 
-                                        clear_thinking_indicator_if_on_screen() 
-                                        sys.stdout.write(ANSI_RESET); sys.stdout.flush() 
-                                        strip_leading_newline_next_write = True 
+                                    if not hide_reasoning:
+                                        write_thinking_chunk_with_indicator(think_content_chunk)
+                                        clear_thinking_indicator_if_on_screen()
+                                        sys.stdout.write(ANSI_RESET); sys.stdout.flush()
+                                        strip_leading_newline_next_write = True
                                     elif hide_reasoning:
-                                         update_spinner() 
-                                    
+                                         update_spinner()
+
                                     temp_idx = think_end_pos + len('</think>')
-                                    in_think_block_tag = False 
-                        
-                        if output_to_print_for_normal_content: 
+                                    in_think_block_tag = False
+
+                        if output_to_print_for_normal_content:
                             clear_thinking_indicator_if_on_screen()
                             if strip_leading_newline_next_write:
                                 output_to_print_for_normal_content = output_to_print_for_normal_content.lstrip('\n')
@@ -504,86 +507,86 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                             processed_response_chunks.append(processed_chunk_for_history_this_delta)
 
                 elif item_type == 'DONE':
-                    clear_thinking_indicator_if_on_screen() 
-                    break 
-                elif item_type == 'ERROR':
-                    final_status_success = False 
                     clear_thinking_indicator_if_on_screen()
-                    stop_spinner(success=False) 
+                    break
+                elif item_type == 'ERROR':
+                    final_status_success = False
+                    clear_thinking_indicator_if_on_screen()
+                    stop_spinner(success=False)
                     if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
-                    sys.stdout.flush() 
-                    sys.stderr.write(f"\n{data}\n") 
-                    return None 
-            
-            except queue.Empty: 
-                if spinner_active: update_spinner() 
-                if not worker_thread.is_alive(): 
+                    sys.stdout.flush()
+                    sys.stderr.write(f"\n{data}\n")
+                    return None
+
+            except queue.Empty:
+                if spinner_active: update_spinner()
+                if not worker_thread.is_alive():
                     clear_thinking_indicator_if_on_screen()
                     try:
                         item_type, data = q.get_nowait()
-                        if item_type == 'DONE': 
-                            break 
-                        if item_type == 'ERROR': 
+                        if item_type == 'DONE':
+                            break
+                        if item_type == 'ERROR':
                             final_status_success = False; stop_spinner(success=False)
                             if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
                             sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
-                    except queue.Empty: 
-                        if final_status_success: 
+                    except queue.Empty:
+                        if final_status_success:
                             final_status_success = False; stop_spinner(success=False)
                             sys.stderr.write(f"\n{ANSI_EL}Worker thread finished unexpectedly.\n")
-                        return None 
-                    break 
-        
+                        return None
+                    break
+
         clear_thinking_indicator_if_on_screen()
-        if spinner_active: stop_spinner(success=final_status_success) 
-        
+        if spinner_active: stop_spinner(success=final_status_success)
+
         if not hide_reasoning:
-            if is_reasoning_deepseek: 
-                sys.stdout.write(ANSI_RESET) 
-                sys.stdout.write("\n" + REASONING_END_MARKER + "\n") 
-            if in_think_block_tag: 
-                sys.stdout.write(ANSI_RESET) 
+            if is_reasoning_deepseek:
+                sys.stdout.write(ANSI_RESET)
+                sys.stdout.write("\n" + REASONING_END_MARKER + "\n")
+            if in_think_block_tag:
+                sys.stdout.write(ANSI_RESET)
         sys.stdout.flush()
 
         processed_response = "".join(processed_response_chunks)
-        return processed_response.lstrip('\n') if processed_response else "" 
+        return processed_response.lstrip('\n') if processed_response else ""
 
     except KeyboardInterrupt:
-        final_status_success = False 
-        sys.stdout.write(ANSI_RESET); sys.stderr.write(ANSI_RESET) 
+        final_status_success = False
+        sys.stdout.write(ANSI_RESET); sys.stderr.write(ANSI_RESET)
         sys.stdout.flush(); sys.stderr.flush()
-        
-        clear_thinking_indicator_if_on_screen(); stop_spinner(success=False) 
 
-        if not hide_reasoning: 
+        clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
+
+        if not hide_reasoning:
             if is_reasoning_deepseek or in_think_block_tag:
-                 sys.stdout.write(ANSI_RESET); sys.stdout.flush() 
+                 sys.stdout.write(ANSI_RESET); sys.stdout.flush()
                  sys.stderr.write(f"\n{REASONING_END_MARKER if is_reasoning_deepseek else '</think>'}\n(Interrupted)\n")
 
         sys.stderr.write(f"{ANSI_GREEN}\n^C Cancelled Stream!\n{ANSI_RESET}"); sys.stderr.flush()
-        
+
         if TERMIOS_AVAILABLE:
             try:
                 if sys.stdin.isatty() and sys.stdin.fileno() >= 0:
                     termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
             except Exception as e_flush:
                 sys.stderr.write(f"Warn: Flushing stdin (TCIFLUSH) failed: {e_flush}\n"); sys.stderr.flush()
-        return None 
+        return None
     except Exception as e:
-        final_status_success = False 
+        final_status_success = False
         clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
         if not hide_reasoning and (is_reasoning_deepseek or in_think_block_tag): sys.stdout.write(ANSI_RESET)
         sys.stdout.flush()
         sys.stderr.write(f"\n{ANSI_EL}An unexpected error occurred in stream_response: {str(e)}\n")
         traceback.print_exc(file=sys.stderr)
-        return None 
+        return None
     finally:
         clear_thinking_indicator_if_on_screen()
-        if 'spinner_active' in locals() and spinner_active : 
-             sys.stderr.write(f"\r{ANSI_EL}"); sys.stderr.flush() 
-        
-        if 'worker_thread' in locals() and worker_thread.is_alive(): 
-            worker_thread.join(timeout=1.0) 
+        if 'spinner_active' in locals() and spinner_active :
+             sys.stderr.write(f"\r{ANSI_EL}"); sys.stderr.flush()
+
+        if 'worker_thread' in locals() and worker_thread.is_alive():
+            worker_thread.join(timeout=1.0)
 
 # --- Terminal Control Helper Functions (set_terminal_no_echoctl, restore_terminal_settings) ---
 def set_terminal_no_echoctl(fd: int) -> Optional[List]:
@@ -591,8 +594,8 @@ def set_terminal_no_echoctl(fd: int) -> Optional[List]:
         return None
     try:
         old_settings = termios.tcgetattr(fd)
-        new_settings = list(old_settings) 
-        new_settings[3] &= ~termios.ECHOCTL  
+        new_settings = list(old_settings)
+        new_settings[3] &= ~termios.ECHOCTL
         termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
         return old_settings
     except termios.error:
@@ -604,178 +607,200 @@ def restore_terminal_settings(fd: int, old_settings: Optional[List]):
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     except termios.error:
-        pass 
+        pass
 
 # --- Readline completer for directives and commands ---
 COMPLETION_TOKENS = ["@file(", "@url(", "@search(", "!clear"]
+_completion_matches_cache = [] # Cache for current completion options
 
 def custom_directive_completer(text: str, state: int) -> Optional[str]:
-    """Completer for @directives and !commands."""
-    
-    # --- Begin Debug Prints for Completer ---
-    # These will print to stderr every time tab is pressed in interactive mode
-    # sys.stderr.write(f"DEBUG_COMPLETER: text_arg='{text}', state={state}\n") # Using sys.stderr.write for atomicity
-    line_buffer_debug = "N/A"
-    begin_idx_debug = -1
-    end_idx_debug = -1
-    current_typing_debug = "N/A" 
+    """Completer for @directives, !commands, and file paths within @file(...)."""
+    global _completion_matches_cache
 
-    if 'readline' in sys.modules and hasattr(readline, 'get_line_buffer'): # Check specific functions
-        try:
-            line_buffer_debug = readline.get_line_buffer()
-            begin_idx_debug = readline.get_begidx()
-            end_idx_debug = readline.get_endidx()
-            # Only slice if indices are valid, otherwise, it can cause issues.
-            if begin_idx_debug != -1 and end_idx_debug != -1 and begin_idx_debug <= end_idx_debug :
-                current_typing_debug = line_buffer_debug[begin_idx_debug:end_idx_debug]
-            else: # If indices are not valid, fall back to the text argument
-                current_typing_debug = text 
-        except Exception as e:
-            sys.stderr.write(f"DEBUG_COMPLETER: Error getting readline info: {e}\n")
-            current_typing_debug = text # Fallback to text arg if readline functions fail
-            
+    # --- Begin Debug Prints for Completer ---
+    # sys.stderr.write(f"DEBUG_COMPLETER: text_arg='{text}', state={state}\n")
+    # line_buffer_debug = "N/A"
+    # begin_idx_debug = -1
+    # end_idx_debug = -1
+    # current_typing_debug = "N/A"
+    # if 'readline' in sys.modules and hasattr(readline, 'get_line_buffer'):
+    #     try:
+    #         line_buffer_debug = readline.get_line_buffer()
+    #         begin_idx_debug = readline.get_begidx()
+    #         end_idx_debug = readline.get_endidx()
+    #         if begin_idx_debug != -1 and end_idx_debug != -1 and begin_idx_debug <= end_idx_debug :
+    #             current_typing_debug = line_buffer_debug[begin_idx_debug:end_idx_debug]
+    #         else:
+    #             current_typing_debug = text
+    #     except Exception as e:
+    #         sys.stderr.write(f"DEBUG_COMPLETER: Error getting readline info: {e}\n")
+    #         current_typing_debug = text
     # sys.stderr.write(f"DEBUG_COMPLETER: text_arg='{text}', state={state}, line_buffer='{line_buffer_debug}', "
     #                  f"begin_idx={begin_idx_debug}, end_idx={end_idx_debug}, "
     #                  f"current_typing='{current_typing_debug}'\n")
-    sys.stderr.flush() # Ensure debug output is seen immediately
+    # sys.stderr.flush()
     # --- End Debug Prints for Completer ---
 
-    current_typing_for_logic = current_typing_debug
+    current_typing_for_logic = text # Since delimiters like '(' are removed, 'text' contains the full token
 
-    options = [token for token in COMPLETION_TOKENS if token.startswith(current_typing_for_logic)]
-    # sys.stderr.write(f"DEBUG_COMPLETER: options_found={options}\n")
-    sys.stderr.flush() 
-    
-    if state < len(options):
-        # sys.stderr.write(f"DEBUG_COMPLETER: Returning option: {options[state]}\n")
-        sys.stderr.flush()
-        return options[state]
-    else:
-        # sys.stderr.write(f"DEBUG_COMPLETER: No more options for this state.\n")
-        sys.stderr.flush()
+    directive_prefix = "@file("
+    if current_typing_for_logic.startswith(directive_prefix):
+        if state == 0:
+            _completion_matches_cache = []
+            path_typed_after_directive = current_typing_for_logic[len(directive_prefix):]
+            
+            # Expand ~ and environment variables
+            expanded_partial_path = os.path.expanduser(os.path.expandvars(path_typed_after_directive))
+
+            # Determine the directory to search in and the prefix for items
+            # e.g., if expanded_partial_path is "my_dir/partial_file"
+            # search_dir = "my_dir", item_prefix_for_glob = "partial_file"
+            # e.g., if expanded_partial_path is "partial_file" (no slashes)
+            # search_dir = "" (becomes "." later), item_prefix_for_glob = "partial_file"
+            search_dir = os.path.dirname(expanded_partial_path)
+            item_prefix_for_glob = os.path.basename(expanded_partial_path)
+
+            if not search_dir: # If path has no directory part, search in current directory
+                search_dir = "."
+            
+            # Construct the glob pattern, e.g., "my_dir/partial_file*" or "./partial_file*"
+            glob_pattern = os.path.join(search_dir, item_prefix_for_glob + "*")
+            
+            # sys.stderr.write(f"\nDEBUG_FILE_COMPL: text='{current_typing_for_logic}', path_after='{path_typed_after_directive}', expanded='{expanded_partial_path}', glob_pattern='{glob_pattern}'\n")
+
+            try:
+                # Perform glob search
+                for path_match_from_glob in glob.glob(glob_pattern):
+                    # `path_match_from_glob` is the actual path found (e.g., "my_dir/file.txt" or "some_folder/")
+                    # We need to return the full string that readline should use to replace `text`.
+                    # This means prefixing with "@file(" again.
+                    
+                    completion_candidate = directive_prefix + path_match_from_glob
+                    
+                    # Add trailing slash for directories to the completion candidate
+                    if os.path.isdir(path_match_from_glob) and not completion_candidate.endswith(os.sep):
+                        completion_candidate += os.sep
+                    
+                    _completion_matches_cache.append(completion_candidate)
+            except Exception as e:
+                sys.stderr.write(f"\nError during file path completion: {str(e)}\n") # Log error
+            _completion_matches_cache.sort() # Sort results
+
+        if state < len(_completion_matches_cache):
+            # sys.stderr.write(f"DEBUG_FILE_COMPL: Returning option: {_completion_matches_cache[state]}\n")
+            return _completion_matches_cache[state]
         return None
+    else:
+        # Fallback to original directive/command completion
+        if state == 0:
+            _completion_matches_cache = []
+            options = [token for token in COMPLETION_TOKENS if token.startswith(current_typing_for_logic)]
+            _completion_matches_cache.extend(options)
+            # sys.stderr.write(f"DEBUG_DIRECTIVE_COMPL: options_found={_completion_matches_cache} for text='{current_typing_for_logic}'\n")
+
+        if state < len(_completion_matches_cache):
+            # sys.stderr.write(f"DEBUG_DIRECTIVE_COMPL: Returning option: {_completion_matches_cache[state]}\n")
+            return _completion_matches_cache[state]
+        return None
+
 
 # --- setup_tty_stdin and restore_stdin ---
 def setup_tty_stdin() -> Tuple[int, Optional[str]]:
     original_stdin_fd = -1
-    pipe_input_content = "" 
-    readline_available_flag = ('readline' in sys.modules and 
+    pipe_input_content = ""
+    readline_available_flag = ('readline' in sys.modules and
                                hasattr(sys.modules['readline'], 'read_history_file') and
                                hasattr(sys.modules['readline'], 'set_completer') and
                                hasattr(sys.modules['readline'], 'parse_and_bind') and
-                               hasattr(sys.modules['readline'], 'get_line_buffer') and 
-                               hasattr(sys.modules['readline'], 'get_begidx') and    
+                               hasattr(sys.modules['readline'], 'get_line_buffer') and
+                               hasattr(sys.modules['readline'], 'get_begidx') and
                                hasattr(sys.modules['readline'], 'get_endidx') and
-                               hasattr(sys.modules['readline'], 'get_completer_delims')) # Added check for get_completer_delims
+                               hasattr(sys.modules['readline'], 'get_completer_delims'))
 
     try:
-        original_stdin_fd = os.dup(0) 
-        if not sys.stdin.isatty(): 
-            # sys.stderr.write("DEBUG_SETUP: Initial stdin is not a TTY. Attempting to switch to /dev/tty.\n")
-            pipe_input_content = sys.stdin.read() 
-            sys.stdin.close() 
+        original_stdin_fd = os.dup(0)
+        if not sys.stdin.isatty():
+            pipe_input_content = sys.stdin.read()
+            sys.stdin.close()
             try:
                 new_stdin_fd = os.open('/dev/tty', os.O_RDONLY)
-                os.dup2(new_stdin_fd, 0) 
-                os.close(new_stdin_fd) 
-                sys.stdin = open(0, 'r', closefd=False) 
-                # sys.stderr.write("DEBUG_SETUP: Successfully switched stdin to /dev/tty.\n")
+                os.dup2(new_stdin_fd, 0)
+                os.close(new_stdin_fd)
+                sys.stdin = open(0, 'r', closefd=False)
             except OSError as e:
-                # sys.stderr.write(f"WARN_SETUP: Could not switch to TTY for interactive input: {e}\n")
-                # sys.stderr.write("WARN_SETUP: Fallback to original (non-TTY) stdin. Interactive mode might be limited.\n")
                 try:
                     os.dup2(original_stdin_fd, 0)
                     sys.stdin = open(0, 'r', closefd=False)
-                    # sys.stderr.write("DEBUG_SETUP: Restored original (non-TTY) stdin.\n")
                 except OSError as restore_e:
                      sys.stderr.write(f"CRITICAL_SETUP: Could not restore original stdin after TTY switch failure: {restore_e}\n")
-        
+
         if sys.stdin.isatty() and readline_available_flag:
-            # sys.stderr.write("DEBUG_SETUP: stdin is a TTY and readline is available. Setting up readline features.\n")
             try:
                 default_delims = readline.get_completer_delims()
-                # sys.stderr.write(f"DEBUG_SETUP: Default readline completer delimiters: '{default_delims}'\n")
-                
-                # <<<< KEY CHANGE: MODIFY DELIMITERS >>>>
-                # If '@' or '!' are in default_delims, completion of "@s" might not work as expected.
-                # Let's try removing common special characters used by our directives from delimiters.
                 new_delims = default_delims
-                for char_to_remove in ['@', '!', '(', ')']: # Remove chars that are part of our tokens
+                for char_to_remove in ['@', '!', '(', ')', '/']: # Ensure '/' is not a delimiter for paths
                     new_delims = new_delims.replace(char_to_remove, '')
-                
+
                 if new_delims != default_delims:
                     readline.set_completer_delims(new_delims)
                     # sys.stderr.write(f"DEBUG_SETUP: MODIFIED readline completer delimiters to: '{new_delims}'\n")
-                # else:
-                #    sys.stderr.write(f"DEBUG_SETUP: Default delimiters did not contain '@', '!', '(', ')'. No changes made.\n")
-
 
                 readline.set_completer(custom_directive_completer)
                 readline.parse_and_bind('tab: complete')
 
                 history_file = os.path.join(os.path.expanduser("~"), ".ag_history")
                 try: readline.read_history_file(history_file)
-                except FileNotFoundError: pass 
-                except Exception: pass 
-                
+                except FileNotFoundError: pass
+                except Exception: pass
+
                 import atexit
                 def save_history():
                     try: readline.write_history_file(history_file)
-                    except Exception: pass 
+                    except Exception: pass
                 atexit.register(save_history)
-                # sys.stderr.write("DEBUG_SETUP: Readline history and completer setup complete.\n")
             except Exception as e_readline:
-                # sys.stderr.write(f"WARN_SETUP: Readline setup failed with exception: {e_readline}\n")
-                traceback.print_exc(file=sys.stderr) 
+                traceback.print_exc(file=sys.stderr)
         elif not sys.stdin.isatty():
             None
         elif not readline_available_flag:
-            # sys.stderr.write("DEBUG_SETUP: readline module not available or not fully functional, completion skipped.\n")
             if 'readline' not in sys.modules:
                 None
-                # sys.stderr.write("DEBUG_SETUP: 'readline' module not in sys.modules. Please install it (e.g., 'pip install gnureadline' on macOS, 'pyreadline3' on Windows).\n")
             else:
                 missing_attrs = []
-                for attr in ['read_history_file', 'set_completer', 'parse_and_bind', 'get_line_buffer', 
+                for attr in ['read_history_file', 'set_completer', 'parse_and_bind', 'get_line_buffer',
                              'get_begidx', 'get_endidx', 'get_completer_delims']:
                     if not hasattr(sys.modules['readline'], attr): missing_attrs.append(attr)
-                # if missing_attrs:
-                #     sys.stderr.write(f"DEBUG_SETUP: 'readline' module is imported but missing attributes: {', '.join(missing_attrs)}\n")
-                # else:
-                #     sys.stderr.write(f"DEBUG_SETUP: 'readline' module is imported and all checked attributes are present.\n")
-
 
     except Exception as e:
-        # sys.stderr.write(f"ERROR_SETUP: Error during TTY/stdin setup: {e}\n")
         traceback.print_exc(file=sys.stderr)
-        if original_stdin_fd != -1 and original_stdin_fd != 0: 
-            try: os.close(original_stdin_fd) 
-            except OSError: pass 
-            original_stdin_fd = -1 
-            
+        if original_stdin_fd != -1 and original_stdin_fd != 0:
+            try: os.close(original_stdin_fd)
+            except OSError: pass
+            original_stdin_fd = -1
+
     return original_stdin_fd, pipe_input_content
 
 def restore_stdin(original_stdin_fd: int):
     try:
-        if original_stdin_fd != -1: 
+        if original_stdin_fd != -1:
             current_stdin_fd = -1
             try:
                 if sys.stdin and not sys.stdin.closed:
-                    current_stdin_fd = sys.stdin.fileno() 
+                    current_stdin_fd = sys.stdin.fileno()
                     sys.stdin.close()
-            except Exception: 
+            except Exception:
                 pass
 
             try:
-                os.dup2(original_stdin_fd, 0) 
-                sys.stdin = open(0, 'r', closefd=False) 
-            except Exception: 
+                os.dup2(original_stdin_fd, 0)
+                sys.stdin = open(0, 'r', closefd=False)
+            except Exception:
                 pass
             finally:
-                if original_stdin_fd != 0: 
+                if original_stdin_fd != 0:
                     try: os.close(original_stdin_fd)
                     except OSError: pass
-    except Exception: 
+    except Exception:
         pass
 
 # --- Modified main Function ---
@@ -798,7 +823,7 @@ def main():
     args = parser.parse_args()
 
     if args.model_type == 'gemini':
-        args.hide_reasoning = True 
+        args.hide_reasoning = True
 
     freq_penalty = args.frequency_penalty if args.frequency_penalty != -1.0 else None
     pres_penalty = args.presence_penalty if args.presence_penalty != -1.0 else None
@@ -809,18 +834,18 @@ def main():
         sys.exit(f"Error initializing OpenAI client: {e}")
 
     messages: List[Dict[str, str]] = []
-    original_stdin_fd, initial_pipe_input_content = setup_tty_stdin() 
-    
-    is_readline_available_in_main = ('readline' in sys.modules and 
+    original_stdin_fd, initial_pipe_input_content = setup_tty_stdin()
+
+    is_readline_available_in_main = ('readline' in sys.modules and
                                    hasattr(sys.modules['readline'], 'get_line_buffer'))
-    
+
     original_termios_settings = None
-    if TERMIOS_AVAILABLE and sys.stdin.isatty(): 
+    if TERMIOS_AVAILABLE and sys.stdin.isatty():
         try:
-            fd_val = sys.stdin.fileno() 
-            if fd_val >=0: 
+            fd_val = sys.stdin.fileno()
+            if fd_val >=0:
                  original_termios_settings = set_terminal_no_echoctl(fd_val)
-        except Exception: 
+        except Exception:
             pass
 
     grep_prompt_template = """I want you to act strictly as a Linux `grep` command filter.
@@ -835,61 +860,61 @@ Pattern: "{pattern}"
 Input Text:
 {input_text}
 Matching Lines Only:"""
-    
+
     has_used_initial_pipe_input = False
 
-    try: 
-        if args.raw_text: 
+    try:
+        if args.raw_text:
             user_content = args.raw_text
-            if initial_pipe_input_content: 
+            if initial_pipe_input_content:
                 user_content = f"Context from piped input:\n{initial_pipe_input_content.strip()}\n\nUser Query: {user_content}"
-            
+
             processed_user_content = process_input_directives(user_content)
 
             if args.grep_enabled:
-                if not initial_pipe_input_content: 
+                if not initial_pipe_input_content:
                      sys.exit("Error: --grep-enabled requires piped input when providing a direct question (raw_text).")
                 messages = [{"role": "user", "content": grep_prompt_template.format(pattern=args.raw_text, input_text=initial_pipe_input_content)}]
             else:
                 messages = [{"role": "user", "content": processed_user_content}]
 
             response_content = stream_response(client, args.model, args.model_type, messages, args.max_tokens, freq_penalty, pres_penalty, args.hide_reasoning)
-            if response_content is not None and not response_content.endswith('\n'): sys.stdout.write("\n") 
-            sys.stdout.flush(); sys.exit(0) 
+            if response_content is not None and not response_content.endswith('\n'): sys.stdout.write("\n")
+            sys.stdout.flush(); sys.exit(0)
 
         sys.stderr.write("Entering interactive mode. Use Ctrl+D to submit, !cmd, @file, @url, @search, Tab for completion:\n")
-        
-        while True: 
+
+        while True:
             sys.stderr.write(f"\n{ANSI_RESET}💥 Ask (Ctrl+D Submit, !cmd, @file, @url, @search, Tab completion):\n")
-            
-            current_prompt_accumulator: List[str] = [] 
+
+            current_prompt_accumulator: List[str] = []
 
             if initial_pipe_input_content and not has_used_initial_pipe_input:
                 current_prompt_accumulator.append(f"Context from initial piped input:\n{initial_pipe_input_content.strip()}")
-            while True: 
+            while True:
                 current_accumulated_str_for_prompt_char = '\n'.join(current_prompt_accumulator).strip()
-                prompt_char = "  " if current_accumulated_str_for_prompt_char else "> " 
-                
+                prompt_char = "  " if current_accumulated_str_for_prompt_char else "> "
+
                 try:
-                    user_line_input = input(prompt_char) 
+                    user_line_input = input(prompt_char)
                     stripped_user_line = user_line_input.strip()
 
                     if stripped_user_line.startswith('!'):
                         command_str_from_input = stripped_user_line[1:].strip()
-                        
+
                         if command_str_from_input.lower() == 'clear':
-                            messages.clear() 
-                            current_prompt_accumulator.clear() 
-                            sys.stdout.write(ANSI_CLEAR_SCREEN); sys.stdout.flush() 
+                            messages.clear()
+                            current_prompt_accumulator.clear()
+                            sys.stdout.write(ANSI_CLEAR_SCREEN); sys.stdout.flush()
                             sys.stderr.write("Conversation history and current input cleared.\n")
-                            break 
-                        elif command_str_from_input: 
+                            break
+                        elif command_str_from_input:
                             sys.stderr.write(f"\nExecuting: `{command_str_from_input}`\n---\n")
                             command_output_str = execute_command(command_str_from_input)
-                            sys.stderr.write(command_output_str) 
-                            if not command_output_str.endswith('\n'): sys.stderr.write("\n") 
+                            sys.stderr.write(command_output_str)
+                            if not command_output_str.endswith('\n'): sys.stderr.write("\n")
                             sys.stderr.write("---\n"); sys.stderr.flush()
-                            
+
                             formatted_cmd_output_for_prompt = (
                                 f"--- User executed command `{command_str_from_input}` "
                                 f"which produced the following output ---\n{command_output_str.strip()}\n"
@@ -897,79 +922,79 @@ Matching Lines Only:"""
                             )
                             current_prompt_accumulator.append(formatted_cmd_output_for_prompt)
                             sys.stderr.write("Command output added to current prompt. Continue typing or Ctrl+D to submit.\n")
-                        else: 
-                            current_prompt_accumulator.append(user_line_input) 
-                    else: 
+                        else:
+                            current_prompt_accumulator.append(user_line_input)
+                    else:
                         current_prompt_accumulator.append(user_line_input)
 
-                except EOFError: 
-                    sys.stderr.write(ANSI_GREEN + "^D EOF!\n" + ANSI_RESET) 
-                    break 
+                except EOFError:
+                    sys.stderr.write(ANSI_GREEN + "^D EOF!\n" + ANSI_RESET)
+                    break
 
-                except KeyboardInterrupt: 
-                    sys.stderr.write(ANSI_GREEN + "\n^C Cancelled!\n" + ANSI_RESET) 
-                    
+                except KeyboardInterrupt:
+                    sys.stderr.write(ANSI_GREEN + "\n^C Cancelled!\n" + ANSI_RESET)
+
                     readline_buffer_non_empty = False
-                    if is_readline_available_in_main: 
+                    if is_readline_available_in_main:
                         try:
                             if 'readline' in sys.modules and hasattr(sys.modules['readline'], 'get_line_buffer'):
                                 if sys.modules['readline'].get_line_buffer(): readline_buffer_non_empty = True
-                        except Exception: pass 
-                    
+                        except Exception: pass
+
                     current_input_has_content = bool(''.join(current_prompt_accumulator).strip()) or readline_buffer_non_empty
 
                     if current_input_has_content:
-                        current_prompt_accumulator.clear() 
-                        # sys.stderr.write("\nCurrent input cleared due to ^C. Enter new input or Ctrl+D/Ctrl+C again.\n")
-                    else: 
+                        current_prompt_accumulator.clear()
+                    else:
                         sys.stderr.write(ANSI_RESET); sys.stderr.flush()
-                        raise 
-            
+                        raise
+
             final_prompt_str_for_llm = '\n'.join(current_prompt_accumulator).strip()
-            
-            if not final_prompt_str_for_llm: 
-                continue 
+
+            if not final_prompt_str_for_llm:
+                continue
 
             if initial_pipe_input_content and not has_used_initial_pipe_input and \
                any(initial_pipe_input_content.strip() in part for part in current_prompt_accumulator):
                 has_used_initial_pipe_input = True
-            
+
             processed_input_for_llm = process_input_directives(final_prompt_str_for_llm)
             messages.append({"role": "user", "content": processed_input_for_llm})
-            
-            sys.stdout.write(f"{ANSI_RESET}💡:\n"); sys.stdout.flush() 
+
+            sys.stdout.write(f"{ANSI_RESET}💡:\n"); sys.stdout.flush()
             response_content = stream_response(client, args.model, args.model_type, messages, args.max_tokens, freq_penalty, pres_penalty, args.hide_reasoning)
-            
-            if response_content is not None: 
-                messages.append({"role": "assistant", "content": response_content}) 
-                if response_content and not response_content.endswith('\n'): 
-                    sys.stdout.write("\n") 
+
+            if response_content is not None:
+                messages.append({"role": "assistant", "content": response_content})
+                if response_content and not response_content.endswith('\n'):
+                    sys.stdout.write("\n")
                 sys.stdout.flush()
-            sys.stdout.write(ANSI_RESET) 
+            sys.stdout.write(ANSI_RESET)
             sys.stdout.flush()
 
-    except KeyboardInterrupt: 
-        pass 
-    except Exception as e: 
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
         sys.stderr.write(f"\n{ANSI_RESET}An unexpected error occurred in main loop: {e}\n")
         traceback.print_exc(file=sys.stderr)
     finally:
         if TERMIOS_AVAILABLE and original_termios_settings is not None:
             current_stdin_is_tty = False; current_stdin_fd_val = -1
-            try: 
+            try:
                 if sys.stdin and not sys.stdin.closed:
                     current_stdin_fd_val = sys.stdin.fileno()
                     if current_stdin_fd_val >=0 and os.isatty(current_stdin_fd_val):
                         current_stdin_is_tty = True
-            except Exception: pass 
-            
-            if current_stdin_is_tty: 
+            except Exception: pass
+
+            if current_stdin_is_tty:
                 restore_terminal_settings(current_stdin_fd_val, original_termios_settings)
-        
-        restore_stdin(original_stdin_fd) 
-        sys.stderr.write(ANSI_RESET); sys.stdout.write(ANSI_RESET) 
+
+        restore_stdin(original_stdin_fd)
+        sys.stderr.write(ANSI_RESET); sys.stdout.write(ANSI_RESET)
         sys.stderr.flush(); sys.stdout.flush()
 
 if __name__ == '__main__':
     main()
+
 
