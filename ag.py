@@ -16,11 +16,18 @@ import wcwidth
 from openai import OpenAI, APIError
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple, Any
+
 try:
     import readline
 except ImportError:
     pass 
 
+# 新增: 条件导入 termios
+try:
+    import termios
+    TERMIOS_AVAILABLE = True
+except ImportError:
+    TERMIOS_AVAILABLE = False
 
 # --- Constants ---
 DEFAULT_API_URL = "http://localhost:11434/v1"
@@ -157,7 +164,6 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
 
     full_response_chunks, processed_response_chunks, buffer = [], [], ''
     is_reasoning_deepseek, in_think_block_tag, spinner_active = False, False, False
-    # spinner_chars = itertools.cycle(['🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛'])
     spinner_chars = itertools.cycle(['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'])
     first_content_received_gemini, strip_leading_newline_next_write = False, False
     REASONING_START_MARKER, REASONING_END_MARKER = "--- Reasoning Content ---", "--- End Reasoning ---"
@@ -302,11 +308,11 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                             if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
                             sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
                     except queue.Empty:
-                        if final_status_success:
+                        if final_status_success: # Only show error if we thought it was successful before
                             final_status_success = False; stop_spinner(success=False)
                             sys.stderr.write("\nWorker thread finished unexpectedly.\n")
-                        return None
-                    break
+                        return None # Error already handled or no error data from queue
+                    break # Break from while True if DONE or ERROR handled from get_nowait
         clear_thinking_indicator_if_on_screen()
         if spinner_active: stop_spinner(success=final_status_success)
         if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning:
@@ -314,11 +320,34 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
         processed_response = "".join(processed_response_chunks)
         return processed_response.lstrip('\n') if processed_response else ""
     except KeyboardInterrupt:
-        final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
-        if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
+        final_status_success = False
+        # Ensure ANSI state is reset immediately on interrupt for both stdout and stderr
+        sys.stdout.write(ANSI_RESET)
+        sys.stderr.write(ANSI_RESET) # In case spinner/colors were on stderr
         sys.stdout.flush()
-        if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stderr.write('\n' + REASONING_END_MARKER + '\n')
-        sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET)
+        sys.stderr.flush()
+
+        clear_thinking_indicator_if_on_screen()
+        stop_spinner(success=False)
+        
+        # Reset reasoning block colors if active and not hidden
+        if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning:
+            sys.stdout.write(ANSI_RESET) # Ensures color reset on stdout
+            sys.stdout.flush()
+            sys.stderr.write('\n' + REASONING_END_MARKER + '\n') # Indicate end of reasoning on stderr
+
+        sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET) # User feedback
+        sys.stderr.flush()
+
+        # Try to flush stdin buffer if termios is available
+        if TERMIOS_AVAILABLE:
+            try:
+                # Check stdin is a TTY and its file descriptor is valid before flushing
+                if sys.stdin.isatty() and sys.stdin.fileno() >= 0:
+                    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except Exception as e_flush:
+                sys.stderr.write(f"Warn: Flushing stdin (TCIFLUSH) failed: {e_flush}\n")
+                sys.stderr.flush()
         return None
     except Exception as e:
         final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
@@ -331,27 +360,58 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
              sys.stderr.write("\r" + " " * (len("Thinking... ") + 5) + "\r"); sys.stderr.flush()
         if 'worker_thread' in locals() and worker_thread.is_alive(): worker_thread.join(timeout=1.0)
 
+# --- Terminal Control Helper Functions (set_terminal_no_echoctl, restore_terminal_settings) ---
+def set_terminal_no_echoctl(fd: int) -> Optional[List]:
+    """Disables ECHOCTL terminal setting for the given file descriptor."""
+    if not TERMIOS_AVAILABLE or not os.isatty(fd):
+        return None
+    try:
+        old_settings = termios.tcgetattr(fd)
+        new_settings = list(old_settings) # Create a mutable copy
+        # lflag is at index 3. ECHOCTL is a bit in lflag.
+        new_settings[3] &= ~termios.ECHOCTL 
+        termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
+        return old_settings
+    except termios.error as e:
+        sys.stderr.write(f"Warn: Failed to set terminal no ECHOCTL: {e}\n")
+        return None
+
+def restore_terminal_settings(fd: int, old_settings: Optional[List]):
+    """Restores terminal settings for the given file descriptor."""
+    if not TERMIOS_AVAILABLE or not os.isatty(fd) or old_settings is None:
+        return
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    except termios.error as e:
+        sys.stderr.write(f"Warn: Failed to restore terminal settings: {e}\n")
+
 # --- setup_tty_stdin and restore_stdin ---
 def setup_tty_stdin() -> Tuple[int, Optional[str]]:
     original_stdin_fd = -1
     pipe_input = ""
     readline_available = 'readline' in sys.modules
     try:
-        original_stdin_fd = os.dup(0)
-        if not sys.stdin.isatty():
-            pipe_input = sys.stdin.read()
-            sys.stdin.close()
+        original_stdin_fd = os.dup(0) # Save current stdin
+        if not sys.stdin.isatty(): # If current stdin is not a TTY (e.g. piped input)
+            pipe_input = sys.stdin.read() # Read all piped input
+            sys.stdin.close() # Close the piped stdin
             try:
+                # Try to open /dev/tty as the new stdin
                 new_stdin_fd = os.open('/dev/tty', os.O_RDONLY)
-                os.dup2(new_stdin_fd, 0); os.close(new_stdin_fd)
-                sys.stdin = open(0, 'r', closefd=False)
+                os.dup2(new_stdin_fd, 0) # Duplicate /dev/tty to fd 0 (stdin)
+                os.close(new_stdin_fd) # Close original /dev/tty fd
+                sys.stdin = open(0, 'r', closefd=False) # Re-open sys.stdin from fd 0
             except OSError as e:
-                sys.stderr.write(f"Warning: Could not switch to TTY: {e}\nFallback to original stdin.\n")
+                sys.stderr.write(f"Warning: Could not switch to TTY for interactive input: {e}\n")
+                sys.stderr.write("Fallback to original (non-TTY) stdin. Interactive mode might be limited.\n")
+                # Fallback: restore original stdin if TTY opening failed
                 try:
                     os.dup2(original_stdin_fd, 0)
                     sys.stdin = open(0, 'r', closefd=False)
                 except OSError as restore_e:
-                     sys.stderr.write(f"Critical: Could not restore stdin: {restore_e}\n")
+                     sys.stderr.write(f"Critical: Could not restore original stdin after TTY switch failure: {restore_e}\n")
+        
+        # Setup readline if stdin is now a TTY and readline is available
         if sys.stdin.isatty() and readline_available:
             try:
                 readline.parse_and_bind('tab: complete')
@@ -366,27 +426,41 @@ def setup_tty_stdin() -> Tuple[int, Optional[str]]:
                 atexit.register(save_history)
             except Exception as readline_e: sys.stderr.write(f"Warn: Readline setup failed: {readline_e}\n")
         elif sys.stdin.isatty() and not readline_available:
-            sys.stderr.write("Warn: readline unavailable. Editing features limited for Ctrl+C.\n")
+            sys.stderr.write("Warn: readline unavailable. Editing features limited for Ctrl+C handling during input.\n")
+            
     except Exception as e:
-        sys.stderr.write(f"Error TTY/stdin setup: {e}\n")
+        sys.stderr.write(f"Error during TTY/stdin setup: {e}\n")
+        # Ensure original_stdin_fd is closed if it was dup'd and not 0
         if original_stdin_fd != -1 and original_stdin_fd != 0:
             try: os.close(original_stdin_fd)
-            except OSError: pass
+            except OSError: pass 
+            original_stdin_fd = -1 # Mark as closed or invalid for restore_stdin
+            
     return original_stdin_fd, pipe_input
 
 def restore_stdin(original_stdin_fd: int):
     try:
-        if original_stdin_fd != -1:
+        if original_stdin_fd != -1: # If original_stdin_fd was successfully saved
+            current_stdin_fd = -1
             try:
-                if sys.stdin and not sys.stdin.closed: sys.stdin.close()
-                os.dup2(original_stdin_fd, 0)
-                sys.stdin = open(0, 'r', closefd=False)
-            except Exception as e_dup: sys.stderr.write(f"Warn: Restore stdin failed: {e_dup}\n")
+                if sys.stdin and not sys.stdin.closed:
+                    current_stdin_fd = sys.stdin.fileno()
+                    sys.stdin.close()
+            except Exception: # Ignore errors if sys.stdin is already weird
+                pass
+
+            try:
+                os.dup2(original_stdin_fd, 0) # Restore original stdin fd to 0
+                sys.stdin = open(0, 'r', closefd=False) # Re-open sys.stdin from new fd 0
+            except Exception as e_dup: 
+                sys.stderr.write(f"Warn: Restore stdin using dup2 failed: {e_dup}\n")
             finally:
+                # Close the saved original_stdin_fd only if it's not fd 0 itself
                 if original_stdin_fd != 0:
                     try: os.close(original_stdin_fd)
                     except OSError: pass
-    except Exception as e: sys.stderr.write(f"Error stdin restore: {e}\n")
+    except Exception as e: 
+        sys.stderr.write(f"Error during stdin restoration: {e}\n")
 
 # --- Modified main Function ---
 def main():
@@ -408,8 +482,6 @@ def main():
     args = parser.parse_args()
 
     if args.model_type == 'gemini':
-        # if not args.hide_reasoning and not ('-r' in sys.argv or '--hide-reasoning' in sys.argv):
-        #     sys.stderr.write("Info: --hide-reasoning automatically enabled for --model-type gemini.\n")
         args.hide_reasoning = True
 
     freq_penalty = args.frequency_penalty if args.frequency_penalty != -1.0 else None
@@ -422,8 +494,16 @@ def main():
 
     messages: List[Dict[str, str]] = []
     original_stdin_fd, pipe_input = setup_tty_stdin()
-    # Check if readline module was successfully imported and is usable
     readline_available = 'readline' in sys.modules and hasattr(readline, 'get_line_buffer')
+    
+    original_termios_settings = None
+    # After setup_tty_stdin, sys.stdin should be the TTY if successful
+    if TERMIOS_AVAILABLE and sys.stdin.isatty():
+        try:
+            fd = sys.stdin.fileno()
+            original_termios_settings = set_terminal_no_echoctl(fd)
+        except Exception as e_set_termios: # Catch if fileno() or isatty() fails for some reason
+            sys.stderr.write(f"Warn: Could not get/set termios settings for stdin: {e_set_termios}\n")
 
 
     grep_prompt_template = """I want you to act strictly as a Linux `grep` command filter.
@@ -461,19 +541,18 @@ Matching Lines Only:"""
             sys.stderr.write("\n💥 Ask (Ctrl+D Submit, !cmd, @file, @url):\n")
             lines_for_current_prompt = []
             
-            # Inner loop for collecting one full multi-line user input
             while True: 
                 prompt_char = "> " if not lines_for_current_prompt else "  "
                 try:
                     current_line_text = input(prompt_char)
                     lines_for_current_prompt.append(current_line_text)
                 
-                except EOFError: # Ctrl+D pressed
+                except EOFError: 
                     sys.stderr.write(ANSI_GREEN + "^D EOF!\n" + ANSI_RESET) 
-                    break # Exit inner loop to process collected lines
+                    break 
 
-                except KeyboardInterrupt: # Ctrl+C pressed during input()
-                    sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET);
+                except KeyboardInterrupt: 
+                    sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET); # Script's own cancel message
                     
                     prompt_lines_has_content = False
                     if readline_available:
@@ -481,24 +560,16 @@ Matching Lines Only:"""
                             if readline.get_line_buffer() or bool(lines_for_current_prompt): 
                                  prompt_lines_has_content = True
                         except Exception:
-                            # If readline fails, assume line is empty for safety (will lead to exit)
                             prompt_lines_has_content = False
 
                     if prompt_lines_has_content:
-                        # Line has content: clear it and let user re-enter the current line.
-                        # readline itself handles clearing the visual line on SIGINT.
-                        # sys.stderr.write("Current line input cancelled. Please re-enter.\n")
-                        # The `continue` re-prompts for the same line.
-                        # `lines_for_current_prompt` is not affected yet for this cancelled line.
                         lines_for_current_prompt.clear()
+                        # readline itself handles clearing the visual line on SIGINT if it's managing input.
+                        # If ECHOCTL is off, no terminal-generated ^C should appear here.
                         continue 
                     else:
-                        # Line is empty (or readline unavailable/failed): exit immediately.
-                        # sys.stderr.write("Input line empty, exiting program...\n")
-                        # This raise will be caught by the outermost `except KeyboardInterrupt`
-                        raise 
+                        raise # Caught by outer try/except KeyboardInterrupt in main
             
-            # --- Processing the input after inner loop (Ctrl+D collected some lines) ---
             user_input = '\n'.join(lines_for_current_prompt).strip()
             
             if initial_pipe_input:
@@ -506,10 +577,8 @@ Matching Lines Only:"""
                 initial_pipe_input = "" 
             
             if not user_input: 
-                # This happens if user just pressed Ctrl+D on an empty prompt.
                 continue
 
-            # --- Process special commands ---
             command_executed_this_turn, clear_command_issued = False, False
             user_input_for_llm = user_input 
             first_line_stripped = user_input.splitlines()[0].strip() if user_input else ""
@@ -527,14 +596,12 @@ Matching Lines Only:"""
                     if not output_from_command.endswith('\n'): sys.stdout.write("\n")
                     sys.stdout.write("---\n"); sys.stdout.flush()
                     command_executed_this_turn, user_input_for_llm = True, ""
-                # else: just "!" which is not a special command, so falls through to LLM
             
             if clear_command_issued or (command_executed_this_turn and user_input_for_llm == ""):
                 continue 
-            if not user_input_for_llm.strip(): # If nothing left for LLM after cmd processing
+            if not user_input_for_llm.strip():
                 continue
 
-            # --- Send to LLM ---
             processed_input_for_llm = process_input_directives(user_input_for_llm)
             messages.append({"role": "user", "content": processed_input_for_llm})
             sys.stdout.write("💡:\n"); sys.stdout.flush()
@@ -545,12 +612,40 @@ Matching Lines Only:"""
                 sys.stdout.flush()
 
     except KeyboardInterrupt: 
-        pass
+        # This catches Ctrl+C if it was raised from the inner input loop (empty prompt)
+        # or if stream_response re-raised it (which it currently doesn't, it returns None)
+        # The main purpose is to allow graceful exit.
+        # The "Cancelled!" message for this specific case (empty prompt Ctrl+C)
+        # is already printed in the inner loop's exception handler.
+        # Ensure a newline if ^C was pressed so term prompt isn't on same line.
+        sys.stderr.write("\n") 
+        pass 
     except Exception as e:
         sys.stderr.write(f"\nAn unexpected error occurred in main loop: {e}\n")
         traceback.print_exc(file=sys.stderr)
     finally:
+        # Restore terminal settings first, before stdin FD is potentially changed by restore_stdin
+        if TERMIOS_AVAILABLE and original_termios_settings is not None:
+            current_stdin_is_tty = False
+            current_stdin_fd = -1
+            try:
+                if sys.stdin and not sys.stdin.closed:
+                    current_stdin_fd = sys.stdin.fileno()
+                    if os.isatty(current_stdin_fd):
+                        current_stdin_is_tty = True
+            except Exception: # stdin might be in a weird state
+                 pass 
+            
+            if current_stdin_is_tty:
+                restore_terminal_settings(current_stdin_fd, original_termios_settings)
+            # else: # Log if settings couldn't be restored (optional)
+                # sys.stderr.write("Warn: Did not restore termios settings (stdin not a TTY or inaccessible at exit).\n")
+        
         restore_stdin(original_stdin_fd)
+        # Final newline to ensure shell prompt is clean
+        sys.stderr.write(ANSI_RESET) # Ensure colors are reset before exiting.
+        sys.stderr.flush()
+
 
 if __name__ == '__main__':
     main()
