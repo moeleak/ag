@@ -7,14 +7,22 @@ AG is a powerful command-line interface (CLI) tool that allows you to interact w
 
 ## Key Features
 
-- **OpenAI API Compatibility**: Works with any OpenAI-compatible API endpoint
-- **Multiple Model Types**: Supports both standard OpenAI and Gemini-style model behaviors
-- **Interactive Mode**: Chat session with conversation history
-- **File/URL Integration**: Include file contents or webpage text using `@file(path)` and `@url(URL)` directives
-- **Command Execution**: Run shell commands with `!command` syntax
-- **AI-Powered Grep**: Filter piped input like `grep` with natural language patterns
-- **Streaming Responses**: Real-time output with reasoning visibility control
-- **Terminal Control**: Proper handling of Ctrl+C, TTY management, and terminal settings
+- **Multi-API Compatibility**: Works with any OpenAI-compatible API (including Ollama, LiteLLM, etc.)
+- **Dual Model Support**: Optimized for both OpenAI-style and Gemini-style model behaviors
+- **Smart Content Integration**:
+  - `@file(path)` - Directly include file contents
+  - `@url(URL)` - Fetch and process webpage content
+  - `@search(query)` - Web search results integration
+- **Built-in Command Execution**:
+  - Execute shell commands with `!command` syntax
+  - View output directly in your session
+- **Intelligent Text Filtering**:
+  - AI-powered grep with natural language patterns (`-g` flag)
+  - Pipe-aware input handling
+- **Enhanced Terminal Experience**:
+  - Real-time streaming responses
+  - Optional reasoning visibility
+  - Full terminal control with proper TTY management
 
 ## Installation
 ```bash
@@ -43,10 +51,11 @@ cat file.txt | ag "Your question about the file content"
 cat logfile.txt | ag -g "error messages related to database connections"
 ```
 
-### Include File/URL Content
+### Include File/URL Content / Search from web
 ```
 @file(/path/to/file.txt)
 @url(https://example.com)
+@search(your search content)
 ```
 
 ## Command Syntax
@@ -85,12 +94,17 @@ ag "@url(https://en.wikipedia.org/wiki/Machine_learning) what are the three main
 ```
 
 3. Interactive research session:
-```bash
+```
 ag
 > @url(https://news.ycombinator.com/)
 > what are today's top AI stories?
 > !curl https://api.example.com/data | jq .stats
 > analyze these statistics
+```
+
+4. Web search integration:
+```
+ag "@search(2024 AI trends) summarize top 3 trends"
 ```
 
 ## Keybindings (Interactive Mode)
