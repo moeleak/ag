@@ -316,8 +316,10 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     except KeyboardInterrupt:
         final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
         if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
-
-        sys.stdout.flush(); sys.stderr.write('\n' + REASONING_END_MARKER); sys.stderr.write(ANSI_GREEN + "\n^C Cancelled!\n" + ANSI_RESET); return None
+        sys.stdout.flush()
+        if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stderr.write('\n' + REASONING_END_MARKER + '\n')
+        sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET)
+        return None
     except Exception as e:
         final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
         if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
