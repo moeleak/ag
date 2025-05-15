@@ -9,31 +9,36 @@ import requests
 import time
 import itertools
 import sys
-import threading # <-- Added
-import queue     # <-- Added
+import threading
+import queue
+import traceback
+import wcwidth
 from openai import OpenAI, APIError
 from bs4 import BeautifulSoup
-from typing import List, Dict, Optional, Tuple, Any # <-- Added Any
+from typing import List, Dict, Optional, Tuple, Any
+try:
+    import readline
+except ImportError:
+    pass 
 
 
 # --- Constants ---
 DEFAULT_API_URL = "http://localhost:11434/v1"
 DEFAULT_MODEL = "deepseek-reasoner"
-DEFAULT_MODEL_TYPE = "openai" # <-- Added default model type
+DEFAULT_MODEL_TYPE = "openai"
 DEFAULT_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_FREQUENCY_PENALTY = 0.5
 DEFAULT_PRESENCE_PENALTY = 0.5
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 1.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
 ANSI_GREEN = '\033[32m'
 ANSI_RESET = '\033[0m'
 ANSI_SAVE_CURSOR = '\033[s'
 ANSI_RESTORE_CURSOR = '\033[u'
-ANSI_CLEAR_SCREEN = '\033[2J\033[H' # Clear screen + cursor home
+ANSI_CLEAR_SCREEN = '\033[2J\033[H'
 
 # --- Helper Functions (fetch_webpage, execute_command, process_input_directives) ---
-# ... (保持不变) ...
 def fetch_webpage(url: str) -> Optional[str]:
     """Fetches and extracts text content from a URL."""
     try:
@@ -41,9 +46,8 @@ def fetch_webpage(url: str) -> Optional[str]:
         response = requests.get(url, timeout=15, headers=headers)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        for element in soup(["script", "style", "nav", "footer", "aside"]): # Remove common noise
+        for element in soup(["script", "style", "nav", "footer", "aside"]):
             element.decompose()
-        # Get text, strip leading/trailing whitespace, reduce multiple newlines
         text = soup.get_text(separator='\n', strip=True)
         return re.sub(r'\n\s*\n', '\n\n', text).strip()
     except requests.RequestException as e:
@@ -58,7 +62,7 @@ def execute_command(command: str) -> str:
     try:
         result = subprocess.run(command, shell=True, check=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True) # Use text=True for automatic decoding
+                                text=True)
         return result.stdout
     except subprocess.CalledProcessError as e:
         error_output = f"Error executing command: `{command}`\nExit Code: {e.returncode}\n"
@@ -79,35 +83,33 @@ def process_input_directives(input_str: str) -> str:
         if stripped_line.startswith('@file'):
             match = re.match(r'@file\(([^)]+)\)', stripped_line)
             if match:
-                filename = match.group(1).strip() # Strip spaces inside parens
+                filename = match.group(1).strip()
                 try:
-                    with open(filename, 'r', encoding='utf-8') as f: # Specify encoding
+                    with open(filename, 'r', encoding='utf-8') as f:
                         processed_lines.append(f"--- Content of {filename} ---\n{f.read()}\n--- End of {filename} ---")
                 except FileNotFoundError:
                     sys.stderr.write(f"Error: File not found: {filename}\n")
                 except IOError as e:
                     sys.stderr.write(f"Error reading {filename}: {str(e)}\n")
-                except Exception as e: # Catch other potential errors
+                except Exception as e:
                      sys.stderr.write(f"Unexpected error processing file {filename}: {str(e)}\n")
             else:
-                 processed_lines.append(line) # Keep line if regex doesn't match format
+                 processed_lines.append(line)
         elif stripped_line.startswith('@url'):
             match = re.match(r'@url\(([^)]+)\)', stripped_line)
             if match:
-                url = match.group(1).strip() # Strip spaces inside parens
+                url = match.group(1).strip()
                 webpage_content = fetch_webpage(url)
                 if webpage_content:
                     processed_lines.append(f"--- Content from {url} ---\n{webpage_content}\n--- End of {url} ---")
-                # Error message handled within fetch_webpage
             else:
-                 processed_lines.append(line) # Keep line if regex doesn't match format
+                 processed_lines.append(line)
         else:
             processed_lines.append(line)
     return '\n'.join(processed_lines)
 
 
 # --- API Worker Thread ---
-
 def _api_worker(
     q: queue.Queue,
     client: OpenAI,
@@ -117,7 +119,6 @@ def _api_worker(
     frequency_penalty: Optional[float],
     presence_penalty: Optional[float]
 ):
-    """Worker thread function to call the API and put chunks/signals onto the queue."""
     try:
         params = {
             "model": model,
@@ -127,413 +128,275 @@ def _api_worker(
         }
         if frequency_penalty is not None: params["frequency_penalty"] = frequency_penalty
         if presence_penalty is not None: params["presence_penalty"] = presence_penalty
-
         stream = client.chat.completions.create(**params)
-
         for chunk in stream:
-            q.put(('CHUNK', chunk)) # Put the actual chunk object
-
-        q.put(('DONE', None)) # Signal normal completion
-
+            q.put(('CHUNK', chunk))
+        q.put(('DONE', None))
     except APIError as e:
         q.put(('ERROR', f"API Error: {str(e)}"))
     except Exception as e:
         q.put(('ERROR', f"An unexpected error occurred during streaming: {str(e)}"))
 
-
-# --- Modified stream_response Function ---
-
-# --- Modified stream_response Function ---
-
+# --- stream_response Function ---
 def stream_response(client: OpenAI, model: str, model_type: str, messages: List[Dict[str, str]],
                     max_tokens: int, frequency_penalty: Optional[float],
                     presence_penalty: Optional[float], hide_reasoning: bool) -> Optional[str]:
-    """Streams response, optionally hiding reasoning with a spinner, supports Gemini-style delay."""
-
-    # --- 新增语言检测函数 ---
     def detect_language(text: str) -> str:
-        """简单检测输入文本的主要语言"""                                                                                                                                        # 检查中文字符
-        if re.search(r'[\u4e00-\u9fff]', text):
-            return 'zh'
+        if re.search(r'[\u4e00-\u9fff]', text): return 'zh'
         return 'en'
     LANGUAGE_PROMPTS = {
         'zh': "请用中文回答，且禁止加入拼音。",
         'en': "Please respond in English."
     }
-
-    full_response_chunks = []
-    processed_response_chunks = []
-    buffer = ''
-
     if model_type == 'gemini' and messages:
         last_user_message = next((msg['content'] for msg in reversed(messages) if msg['role'] == 'user'), '')
         current_language = detect_language(last_user_message)
-
         if len(messages) == 1:
-            language_prompt = LANGUAGE_PROMPTS.get(current_language, 'en')
+            language_prompt = LANGUAGE_PROMPTS.get(current_language, LANGUAGE_PROMPTS['en'])
             messages[0]['content'] = f"{language_prompt}\n\n{messages[0]['content']}"
 
-    full_response_chunks = []
-    processed_response_chunks = [] # Stores content intended for history (no reasoning/think tags)
-    buffer = '' # Buffer for standard <think> tag processing
+    full_response_chunks, processed_response_chunks, buffer = [], [], ''
+    is_reasoning_deepseek, in_think_block_tag, spinner_active = False, False, False
+    # spinner_chars = itertools.cycle(['🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛'])
+    spinner_chars = itertools.cycle(['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'])
+    first_content_received_gemini, strip_leading_newline_next_write = False, False
+    REASONING_START_MARKER, REASONING_END_MARKER = "--- Reasoning Content ---", "--- End Reasoning ---"
+    thinking_indicator_char = "🤔"
+    len_thinking_indicator_display_cells = wcwidth.wcwidth(thinking_indicator_char)
+    if len_thinking_indicator_display_cells == -1: len_thinking_indicator_display_cells = 1
+    thinking_indicator_on_screen = False
 
-    is_reasoning_deepseek = False
-    in_think_block_tag = False
-    spinner_active = False
-    # spinner_chars = itertools.cycle(['|', '/', '-', '\\'])
-    # spinner_chars = itertools.cycle(['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘'])
-    # spinner_chars = itertools.cycle(['░', '▒', '▓', '▒'])
-    # spinner_chars = itertools.cycle([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█', '▉', '▊', '▋', '▌', '▍', '▎', '▏'])
-    spinner_chars = itertools.cycle(['🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛'])
-    #spinner_chars = itertools.cycle(['🩷','❤️','🧡','💛','💚','🩵','💙','💜','🖤','🩶','🤍','🤎'])
-    #spinner_chars = itertools.cycle(['✊🏻','✊🏼','✊🏽','✊🏾','✊🏿'])
-    #spinner_chars = itertools.cycle(['💭','💬','💡','🧠'])
-    #spinner_chars = itertools.cycle(['😋','😛','😝','😜','🤪'])
-    first_content_received_gemini = False # Specifically for Gemini initial content detection
-
-    # --- NEW STATE FLAG ---
-    strip_leading_newline_next_write = False
-
-    REASONING_START_MARKER = "--- Reasoning Content ---"
-    REASONING_END_MARKER = "--- End Reasoning ---"
-
+    def clear_thinking_indicator_if_on_screen():
+        nonlocal thinking_indicator_on_screen
+        if thinking_indicator_on_screen:
+            sys.stdout.write(("\b" * len_thinking_indicator_display_cells) + \
+                             (" " * len_thinking_indicator_display_cells) + \
+                             ("\b" * len_thinking_indicator_display_cells))
+            sys.stdout.flush()
+            thinking_indicator_on_screen = False
+    def write_thinking_chunk_with_indicator(text_chunk: str):
+        nonlocal thinking_indicator_on_screen
+        clear_thinking_indicator_if_on_screen()
+        sys.stdout.write(text_chunk + thinking_indicator_char)
+        sys.stdout.flush()
+        thinking_indicator_on_screen = True
     def start_spinner():
         nonlocal spinner_active
+        clear_thinking_indicator_if_on_screen()
         if not spinner_active:
-            sys.stderr.write("Thinking... ")
-            spinner_active = True
-            sys.stderr.flush()
-
+            sys.stderr.write("Thinking... "); spinner_active = True; sys.stderr.flush()
     def update_spinner():
         if spinner_active:
-            spinner_char = next(spinner_chars)
-            sys.stderr.write(f"\rThinking... {spinner_char}")
-            sys.stderr.flush()
-
+            sys.stderr.write(f"\rThinking... {next(spinner_chars)}"); sys.stderr.flush()
     def stop_spinner(success=True):
         nonlocal spinner_active, strip_leading_newline_next_write
         if spinner_active:
-            symbol = "✅" if success else "❌"
-            sys.stderr.write("\r" + " " * 20 + "\r")
-            sys.stderr.write(f"Thinking... {symbol}\n")
-            spinner_active = False
-            sys.stderr.flush()
-            # --- SET FLAG HERE ---
-            # Set the flag whenever the spinner stops due to incoming content or success
-            if success:
-                 strip_leading_newline_next_write = True
-
+            sys.stderr.write("\r" + " " * 20 + "\r" + f"Thinking... {'✅' if success else '❌'}\n")
+            spinner_active = False; sys.stderr.flush()
+            if success: strip_leading_newline_next_write = True
+    
     q = queue.Queue()
-    worker_thread = threading.Thread(
-        target=_api_worker,
-        args=(q, client, model, messages, max_tokens, frequency_penalty, presence_penalty),
-        daemon=True
-    )
-
+    worker_thread = threading.Thread(target=_api_worker, args=(q, client, model, messages, max_tokens, frequency_penalty, presence_penalty), daemon=True)
     worker_thread.start()
-
     final_status_success = True
     try:
-        if hide_reasoning:
-            start_spinner()
-
+        if hide_reasoning: start_spinner()
         while True:
             try:
                 item_type, data = q.get(timeout=0.1)
-
                 if item_type == 'CHUNK':
                     chunk = data
                     if not chunk.choices: continue
                     delta = chunk.choices[0].delta
                     if delta is None: continue
-
-                    reasoning_content = getattr(delta, 'reasoning_content', None)
-                    content = delta.content
-
-                    # --- Stop Gemini spinner ---
+                    reasoning_content, content = getattr(delta, 'reasoning_content', None), delta.content
                     if model_type == 'gemini' and content and not first_content_received_gemini and spinner_active:
-                         stop_spinner() # This will set strip_leading_newline_next_write = True
-                         first_content_received_gemini = True
-
-                    # --- Handle DeepSeek Reasoning ---
+                        stop_spinner(); first_content_received_gemini = True
                     if reasoning_content:
                         if hide_reasoning:
                             if not spinner_active: start_spinner()
                             update_spinner()
                         else:
-                            if spinner_active: stop_spinner() # Stop if showing reasoning
+                            if spinner_active: stop_spinner()
                             if not is_reasoning_deepseek:
-                                is_reasoning_deepseek = True
-                                sys.stdout.write(REASONING_START_MARKER + "\n" + ANSI_GREEN)
-                                sys.stdout.flush()
-                            sys.stdout.write(reasoning_content)
-                            sys.stdout.flush()
-                        continue # Skip normal content processing
-
-                    # --- Handle Standard Content ---
-                    if content:
-                        # End DeepSeek reasoning display if it was active
-                        if is_reasoning_deepseek:
-                            is_reasoning_deepseek = False
-                            if not hide_reasoning:
-                                sys.stdout.write(ANSI_RESET + REASONING_END_MARKER)
-                                sys.stdout.flush()
-
-                        # Stop spinner if it's still active when regular content arrives
-                        # (This handles cases like DeepSeek without reasoning_content but with hidden <think>,
-                        # or just general delay before first content chunk when hide_reasoning is on)
-                        # Exclude Gemini because its spinner stop is handled above.
-                        if model_type != 'gemini' and spinner_active:
-                             stop_spinner() # This will set strip_leading_newline_next_write = True
-
-                        full_response_chunks.append(content) # Add raw content chunk to full history
-                        buffer += content
-
-                        # Process buffer for <think> tags and prepare output
-                        processed_chunk_for_history = '' # Content excluding <think> tags for history list
-                        temp_buffer = buffer
-                        buffer = ''
-                        output_buffer = '' # Content to be printed to stdout this iteration
-
-                        while temp_buffer:
-                            if not in_think_block_tag:
-                                start_pos = temp_buffer.find('<think>')
-                                if start_pos == -1: # No <think> tag start
-                                    chunk_to_process = temp_buffer
-                                    temp_buffer = ''
-
-                                    # Stop spinner if needed (e.g., content arrived while spinner was on)
-                                    # This might be redundant if stopped above, but safe.
-                                    if spinner_active:
-                                        stop_spinner() # Sets the flag
-
-                                    output_buffer += chunk_to_process
-                                    processed_chunk_for_history += chunk_to_process
-
-                                else: # Found <think> tag start
-                                    before_think = temp_buffer[:start_pos]
-                                    processed_chunk_for_history += before_think # Add to history
-
-                                    # Stop spinner if needed before processing pre-think content
-                                    if spinner_active and before_think:
-                                        stop_spinner() # Sets the flag
-
-                                    output_buffer += before_think # Add pre-think content to output
-
-                                    # Handle the <think> tag itself
-                                    in_think_block_tag = True
-                                    temp_buffer = temp_buffer[start_pos + len('<think>'):]
-                                    if hide_reasoning:
-                                        if not spinner_active: start_spinner() # Start spinner for hidden think block
-                                        update_spinner()
-                                    else:
-                                        output_buffer += ANSI_GREEN # Start green for visible think block
-                            else: # Inside a <think> block
-                                end_pos = temp_buffer.find('</think>')
-                                if end_pos == -1: # Still inside <think> block
-                                    if hide_reasoning:
-                                        update_spinner()
-                                        # Consume buffer without adding to output/history
-                                        temp_buffer = ''
-                                    else:
-                                        output_buffer += temp_buffer # Print visible thinking content
-                                        temp_buffer = ''
-                                else: # Found </think> tag end
-                                    think_content = temp_buffer[:end_pos]
-                                    in_think_block_tag = False
-                                    temp_buffer = temp_buffer[end_pos + len('</think>'):]
-
-                                    if hide_reasoning:
-                                        update_spinner()
-                                        # Content inside hidden <think> is not added to output/history
-                                    else:
-                                        output_buffer += think_content # Print visible thinking content
-                                        output_buffer += ANSI_RESET # End green
-
-                        # --- Apply LSTRIP before writing to stdout ---
-                        if strip_leading_newline_next_write and output_buffer:
-                            output_buffer = output_buffer.lstrip('\n')
-                            # Only strip the *very first* time after spinner stops
-                            if output_buffer: # Don't reset if stripping made it empty
+                                clear_thinking_indicator_if_on_screen(); is_reasoning_deepseek = True
+                                sys.stdout.write(REASONING_START_MARKER + "\n" + ANSI_GREEN); sys.stdout.flush()
                                 strip_leading_newline_next_write = False
-
-                        # --- Write to stdout and store processed chunk ---
-                        if output_buffer:
-                            sys.stdout.write(output_buffer)
-                            sys.stdout.flush()
-                        if processed_chunk_for_history:
-                             processed_response_chunks.append(processed_chunk_for_history)
-
-
+                            write_thinking_chunk_with_indicator(reasoning_content)
+                        continue
+                    if content:
+                        if is_reasoning_deepseek:
+                            clear_thinking_indicator_if_on_screen(); is_reasoning_deepseek = False
+                            if not hide_reasoning:
+                                sys.stdout.write(ANSI_RESET + REASONING_END_MARKER + "\n"); sys.stdout.flush()
+                                strip_leading_newline_next_write = True
+                        if model_type != 'gemini' and spinner_active: stop_spinner()
+                        full_response_chunks.append(content); buffer += content
+                        processed_chunk_for_history_this_delta, current_processing_buffer, buffer = '', buffer, ''
+                        output_to_print_for_normal_content, temp_idx = "", 0
+                        while temp_idx < len(current_processing_buffer):
+                            if not in_think_block_tag:
+                                think_start_pos = current_processing_buffer.find('<think>', temp_idx)
+                                if think_start_pos == -1:
+                                    clear_thinking_indicator_if_on_screen()
+                                    normal_chunk = current_processing_buffer[temp_idx:]
+                                    output_to_print_for_normal_content += normal_chunk
+                                    processed_chunk_for_history_this_delta += normal_chunk
+                                    temp_idx = len(current_processing_buffer)
+                                else:
+                                    clear_thinking_indicator_if_on_screen()
+                                    normal_chunk_before_think = current_processing_buffer[temp_idx:think_start_pos]
+                                    output_to_print_for_normal_content += normal_chunk_before_think
+                                    processed_chunk_for_history_this_delta += normal_chunk_before_think
+                                    if output_to_print_for_normal_content:
+                                        if strip_leading_newline_next_write:
+                                            output_to_print_for_normal_content = output_to_print_for_normal_content.lstrip('\n')
+                                            if output_to_print_for_normal_content: strip_leading_newline_next_write = False
+                                        sys.stdout.write(output_to_print_for_normal_content); sys.stdout.flush()
+                                        output_to_print_for_normal_content = ""
+                                    temp_idx = think_start_pos + len('<think>'); in_think_block_tag = True
+                                    if hide_reasoning:
+                                        if not spinner_active: start_spinner()
+                                        update_spinner()
+                                    else:
+                                        if spinner_active: stop_spinner()
+                                        sys.stdout.write(ANSI_GREEN); sys.stdout.flush()
+                            else: # Inside <think>
+                                think_end_pos = current_processing_buffer.find('</think>', temp_idx)
+                                if think_end_pos == -1:
+                                    think_content_chunk = current_processing_buffer[temp_idx:]
+                                    temp_idx = len(current_processing_buffer)
+                                    if hide_reasoning: update_spinner()
+                                    else: write_thinking_chunk_with_indicator(think_content_chunk)
+                                else:
+                                    think_content_chunk = current_processing_buffer[temp_idx:think_end_pos]
+                                    temp_idx = think_end_pos + len('</think>'); in_think_block_tag = False
+                                    if hide_reasoning: update_spinner()
+                                    else:
+                                        clear_thinking_indicator_if_on_screen()
+                                        sys.stdout.write(think_content_chunk + ANSI_RESET); sys.stdout.flush()
+                                        strip_leading_newline_next_write = True
+                        if output_to_print_for_normal_content:
+                            clear_thinking_indicator_if_on_screen()
+                            if strip_leading_newline_next_write:
+                                output_to_print_for_normal_content = output_to_print_for_normal_content.lstrip('\n')
+                                if output_to_print_for_normal_content: strip_leading_newline_next_write = False
+                            sys.stdout.write(output_to_print_for_normal_content); sys.stdout.flush()
+                        if processed_chunk_for_history_this_delta:
+                            processed_response_chunks.append(processed_chunk_for_history_this_delta)
                 elif item_type == 'DONE':
-                    break # Worker finished successfully
-
+                    clear_thinking_indicator_if_on_screen(); break
                 elif item_type == 'ERROR':
-                    final_status_success = False
-                    stop_spinner(success=False) # Stop spinner with failure
-                    if is_reasoning_deepseek or in_think_block_tag:
-                        if not hide_reasoning: sys.stdout.write(ANSI_RESET)
-                    sys.stdout.flush()
-                    sys.stderr.write(f"\n{data}\n")
-                    return None # Indicate error
-
+                    final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
+                    if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
+                    sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
             except queue.Empty:
-                if spinner_active:
-                    update_spinner()
+                if spinner_active: update_spinner()
                 if not worker_thread.is_alive():
-                     # Check queue one last time in case DONE/ERROR arrived just now
-                     try:
-                         item_type, data = q.get_nowait()
-                         if item_type == 'DONE': break
-                         if item_type == 'ERROR':
-                             final_status_success = False
-                             stop_spinner(success=False)
-                             if is_reasoning_deepseek or in_think_block_tag:
-                                 if not hide_reasoning: sys.stdout.write(ANSI_RESET)
-                             sys.stdout.flush()
-                             sys.stderr.write(f"\n{data}\n")
-                             return None
-                     except queue.Empty:
-                         if final_status_success: # Avoid double message
-                             final_status_success = False
-                             stop_spinner(success=False)
-                             sys.stderr.write("\nWorker thread finished unexpectedly.\n")
-                         return None
-                     break # Exit outer loop if DONE/ERROR found
-
-        # --- Final Cleanup ---
-        if spinner_active: # If loop finished while spinner was still active (e.g., hidden <think> at end)
-            stop_spinner(success=final_status_success)
-
-        if is_reasoning_deepseek or in_think_block_tag: # Reset color if needed
-             if not hide_reasoning:
-                 sys.stdout.write(ANSI_RESET)
-                 sys.stdout.flush()
-
-        # Join the chunks meant for history
+                    clear_thinking_indicator_if_on_screen()
+                    try:
+                        item_type, data = q.get_nowait()
+                        if item_type == 'DONE': break
+                        if item_type == 'ERROR':
+                            final_status_success = False; stop_spinner(success=False)
+                            if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
+                            sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
+                    except queue.Empty:
+                        if final_status_success:
+                            final_status_success = False; stop_spinner(success=False)
+                            sys.stderr.write("\nWorker thread finished unexpectedly.\n")
+                        return None
+                    break
+        clear_thinking_indicator_if_on_screen()
+        if spinner_active: stop_spinner(success=final_status_success)
+        if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning:
+            sys.stdout.write(ANSI_RESET); sys.stdout.flush()
         processed_response = "".join(processed_response_chunks)
-        # We keep the lstrip here for the *returned value* to ensure history is clean,
-        # even if the printed output was handled differently.
-        return processed_response.lstrip('\n')
-
+        return processed_response.lstrip('\n') if processed_response else ""
     except KeyboardInterrupt:
-        final_status_success = False
-        stop_spinner(success=False)
-        if is_reasoning_deepseek or in_think_block_tag:
-            if not hide_reasoning: sys.stdout.write(ANSI_RESET)
-        sys.stdout.flush()
-        sys.stderr.write("\nResponse generation interrupted by user.\n")
-        return None
+        final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
+        if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
+
+        sys.stdout.flush(); sys.stderr.write('\n' + REASONING_END_MARKER); sys.stderr.write(ANSI_GREEN + "\n^C Cancelled!\n" + ANSI_RESET); return None
     except Exception as e:
-        final_status_success = False
-        stop_spinner(success=False)
-        if is_reasoning_deepseek or in_think_block_tag:
-            if not hide_reasoning: sys.stdout.write(ANSI_RESET)
-        sys.stdout.flush()
-        sys.stderr.write(f"\nAn unexpected error occurred in stream_response: {str(e)}\n")
-        traceback.print_exc(file=sys.stderr) # Print full traceback
-        return None
+        final_status_success = False; clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
+        if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
+        sys.stdout.flush(); sys.stderr.write(f"\nAn unexpected error occurred in stream_response: {str(e)}\n")
+        traceback.print_exc(file=sys.stderr); return None
     finally:
-        # Ensure cursor is visible and line is clear if spinner was ever active
-        if 'spinner_active' in locals() and spinner_active:
-             sys.stderr.write("\r" + " " * 20 + "\r")
-             sys.stderr.flush()
-
-
-
+        clear_thinking_indicator_if_on_screen()
+        if 'spinner_active' in locals() and spinner_active :
+             sys.stderr.write("\r" + " " * (len("Thinking... ") + 5) + "\r"); sys.stderr.flush()
+        if 'worker_thread' in locals() and worker_thread.is_alive(): worker_thread.join(timeout=1.0)
 
 # --- setup_tty_stdin and restore_stdin ---
-# ... (保持不变) ...
 def setup_tty_stdin() -> Tuple[int, Optional[str]]:
-    """Reads from pipe if available, then switches stdin to /dev/tty."""
     original_stdin_fd = -1
     pipe_input = ""
+    readline_available = 'readline' in sys.modules
     try:
         original_stdin_fd = os.dup(0)
         if not sys.stdin.isatty():
             pipe_input = sys.stdin.read()
             sys.stdin.close()
             try:
-                # Try opening /dev/tty for interactive input
                 new_stdin_fd = os.open('/dev/tty', os.O_RDONLY)
-                os.dup2(new_stdin_fd, 0) # Replace file descriptor 0 (stdin)
-                os.close(new_stdin_fd) # Close the extra descriptor
-                # Re-open sys.stdin using the new file descriptor 0
+                os.dup2(new_stdin_fd, 0); os.close(new_stdin_fd)
                 sys.stdin = open(0, 'r', closefd=False)
             except OSError as e:
-                sys.stderr.write(f"Warning: Could not switch to interactive TTY input: {e}\n")
-                sys.stderr.write("Interactive mode might not work as expected.\n")
-                # Attempt to restore original stdin if TTY switch failed
+                sys.stderr.write(f"Warning: Could not switch to TTY: {e}\nFallback to original stdin.\n")
                 try:
                     os.dup2(original_stdin_fd, 0)
                     sys.stdin = open(0, 'r', closefd=False)
-                except OSError:
-                     sys.stderr.write("Could not restore original stdin.\n")
-                     sys.exit("Fatal: Cannot continue without standard input.")
-
-        # Try enabling readline for better interactive input experience
-        try:
-            import readline
-            # You might want specific bindings, e.g., history search
-            readline.parse_and_bind('tab: complete')
-
-            # Consider loading/saving history:
-            history_file = os.path.join(os.path.expanduser("~"), ".ag_history")
+                except OSError as restore_e:
+                     sys.stderr.write(f"Critical: Could not restore stdin: {restore_e}\n")
+        if sys.stdin.isatty() and readline_available:
             try:
-                readline.read_history_file(history_file)
-            except FileNotFoundError:
-                pass
-            import atexit
-            atexit.register(readline.write_history_file, history_file)
-        except ImportError:
-            pass # Readline not available on all systems (e.g., standard Windows cmd)
-
+                readline.parse_and_bind('tab: complete')
+                history_file = os.path.join(os.path.expanduser("~"), ".ag_history")
+                try: readline.read_history_file(history_file)
+                except FileNotFoundError: pass
+                except Exception as hist_e: sys.stderr.write(f"Warn: Read history failed: {hist_e}\n")
+                import atexit
+                def save_history():
+                    try: readline.write_history_file(history_file)
+                    except Exception as save_hist_e: sys.stderr.write(f"Warn: Save history failed: {save_hist_e}\n")
+                atexit.register(save_history)
+            except Exception as readline_e: sys.stderr.write(f"Warn: Readline setup failed: {readline_e}\n")
+        elif sys.stdin.isatty() and not readline_available:
+            sys.stderr.write("Warn: readline unavailable. Editing features limited for Ctrl+C.\n")
     except Exception as e:
-        sys.stderr.write(f"Error setting up TTY/stdin: {e}\n")
-        # Ensure the original fd is closed if we saved it but failed later
-        if original_stdin_fd != -1:
-            try:
-                os.close(original_stdin_fd)
-            except OSError:
-                pass # Ignore errors closing if it's already closed or invalid
-
+        sys.stderr.write(f"Error TTY/stdin setup: {e}\n")
+        if original_stdin_fd != -1 and original_stdin_fd != 0:
+            try: os.close(original_stdin_fd)
+            except OSError: pass
     return original_stdin_fd, pipe_input
 
-
 def restore_stdin(original_stdin_fd: int):
-    """Closes the saved original standard input file descriptor."""
-    if original_stdin_fd != -1:
-        try:
-            # It's generally better practice to restore the original descriptor
-            # if possible, rather than just closing the saved one.
-            # However, simply closing the saved descriptor prevents resource leaks.
-            # If dup2 was used successfully to switch to /dev/tty,
-            # restoring the original might interfere if the original pipe is closed.
-            # Just closing the saved descriptor is safer in this complex setup.
-            os.close(original_stdin_fd)
-        except OSError as e:
-            # Ignore errors like "bad file descriptor" if it was already closed
-            pass
-        except Exception as e:
-            # Log unexpected errors during cleanup
-            sys.stderr.write(f"Unexpected error closing saved stdin descriptor: {e}\n")
-
+    try:
+        if original_stdin_fd != -1:
+            try:
+                if sys.stdin and not sys.stdin.closed: sys.stdin.close()
+                os.dup2(original_stdin_fd, 0)
+                sys.stdin = open(0, 'r', closefd=False)
+            except Exception as e_dup: sys.stderr.write(f"Warn: Restore stdin failed: {e_dup}\n")
+            finally:
+                if original_stdin_fd != 0:
+                    try: os.close(original_stdin_fd)
+                    except OSError: pass
+    except Exception as e: sys.stderr.write(f"Error stdin restore: {e}\n")
 
 # --- Modified main Function ---
-
 def main():
-    """Main function to parse arguments and run the interactive loop."""
     parser = argparse.ArgumentParser(
         description='AG - Ask GPT from CLI. Interact with OpenAI-compatible APIs.',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults in help
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument('--api-url', help='API endpoint URL', default=DEFAULT_API_URL)
     parser.add_argument('--model', help='Model name to use', default=DEFAULT_MODEL)
-    # <-- Added model-type argument -->
     parser.add_argument('--model-type', help='Type of model API behavior', choices=['openai', 'gemini'], default=DEFAULT_MODEL_TYPE)
     parser.add_argument('--api-key', help='API key (or set OPENAI_API_KEY env var)', default=os.environ.get("OPENAI_API_KEY", DEFAULT_API_KEY))
     parser.add_argument('--max-tokens', type=int, help='Maximum tokens for response', default=DEFAULT_MAX_TOKENS)
-    # Use None as default sentinel for penalties, check before adding to API call
     parser.add_argument('--frequency-penalty', type=float, help='Frequency penalty (e.g., 0.0 to 2.0). Use -1.0 to disable.', default=DEFAULT_FREQUENCY_PENALTY)
     parser.add_argument('--presence-penalty', type=float, help='Presence penalty (e.g., 0.0 to 2.0). Use -1.0 to disable.', default=DEFAULT_PRESENCE_PENALTY)
     parser.add_argument('-g', '--grep-enabled', action='store_true', help='Act as an AI-powered grep filter for piped input')
@@ -542,32 +405,26 @@ def main():
 
     args = parser.parse_args()
 
-    # <-- Automatically enable hide_reasoning for gemini -->
     if args.model_type == 'gemini':
+        # if not args.hide_reasoning and not ('-r' in sys.argv or '--hide-reasoning' in sys.argv):
+        #     sys.stderr.write("Info: --hide-reasoning automatically enabled for --model-type gemini.\n")
         args.hide_reasoning = True
-        # Optional: Inform the user if they didn't explicitly set -r
-        # if not any(arg in sys.argv for arg in ['-r', '--hide-reasoning']):
-        #    sys.stderr.write("Info: --hide-reasoning automatically enabled for --model-type gemini.\n")
 
-
-    # Handle penalty disabling
     freq_penalty = args.frequency_penalty if args.frequency_penalty != -1.0 else None
     pres_penalty = args.presence_penalty if args.presence_penalty != -1.0 else None
 
-
     try:
-        client = OpenAI(
-            base_url=args.api_url,
-            api_key=args.api_key
-        )
+        client = OpenAI( base_url=args.api_url, api_key=args.api_key )
     except Exception as e:
         sys.exit(f"Error initializing OpenAI client: {e}")
 
     messages: List[Dict[str, str]] = []
-    original_stdin_fd, pipe_input = setup_tty_stdin() # Handle pipe and switch to TTY
+    original_stdin_fd, pipe_input = setup_tty_stdin()
+    # Check if readline module was successfully imported and is usable
+    readline_available = 'readline' in sys.modules and hasattr(readline, 'get_line_buffer')
 
-    grep_prompt_template = """
-I want you to act strictly as a Linux `grep` command filter.
+
+    grep_prompt_template = """I want you to act strictly as a Linux `grep` command filter.
 Input will consist of text, potentially multi-line output from another command.
 The pattern can be in natural languages that you need to understand it.
 Your task is to filter this input based on a user-provided pattern.
@@ -575,132 +432,122 @@ Your task is to filter this input based on a user-provided pattern.
 Do NOT include any explanations, introductions, summaries, or conversational text.
 Do NOT add line numbers unless they were present in the original input lines.
 If no lines match, return absolutely ***nothing*** (empty output).
-
 Pattern: "{pattern}"
-
 Input Text:
 {input_text}
-
 Matching Lines Only:"""
-
-    try:
-        # --- Single Shot Mode ---
-        if args.raw_text:
+    
+    try: 
+        if args.raw_text: # Single-shot mode
             user_content = args.raw_text
             if pipe_input:
-                # Prepend pipe input for context, then the user's raw text query
-                user_content = f"{pipe_input.strip()}\n\nUser Query: {user_content}"
-
+                user_content = f"Context from piped input:\n{pipe_input.strip()}\n\nUser Query: {user_content}"
             if args.grep_enabled:
-                if not pipe_input:
-                    sys.exit("Error: --grep-enabled requires piped input.")
-                # Format the prompt specifically for grep mode
-                full_prompt = grep_prompt_template.format(pattern=args.raw_text, input_text=pipe_input)
-                # Grep mode usually doesn't need conversation history
-                messages = [{"role": "user", "content": full_prompt}]
+                if not pipe_input: sys.exit("Error: --grep-enabled requires piped input for single-shot mode.")
+                messages = [{"role": "user", "content": grep_prompt_template.format(pattern=args.raw_text, input_text=pipe_input)}]
             else:
-                processed_content = process_input_directives(user_content)
-                messages.append({"role": "user", "content": processed_content})
+                messages.append({"role": "user", "content": process_input_directives(user_content)})
+            response_content = stream_response(client, args.model, args.model_type, messages, args.max_tokens, freq_penalty, pres_penalty, args.hide_reasoning)
+            if response_content is not None and not response_content.endswith('\n'): sys.stdout.write("\n")
+            sys.stdout.flush(); sys.exit(0)
 
-            # <-- Pass model_type and hide_reasoning to stream_response -->
-            response_content = stream_response(
-                client, args.model, args.model_type, messages, args.max_tokens,
-                freq_penalty, pres_penalty, args.hide_reasoning
-            )
-            # No need to append assistant response if exiting
-            # Ensure newline *after* response, including spinner's potential newline
-            # sys.stdout.write("\n") # Spinner stop adds a newline now
-            restore_stdin(original_stdin_fd) # Restore stdin before exiting
-            sys.exit(0) # Exit after single shot
+        # Interactive mode
+        sys.stderr.write("Entering interactive mode. Use Ctrl+D to submit, Ctrl+C to interact/exit.\n")
+        initial_pipe_input = pipe_input 
 
-        # --- Interactive Mode ---
-        sys.stderr.write("Entering interactive mode. Use Ctrl+D to submit, Ctrl+C to exit.\n")
-        initial_pipe_input = pipe_input # Store initial pipe input for first message
-
-        while True:
-            # Use stderr for prompt to avoid mixing with stdout response/spinner
+        while True: # Outer loop for each full user query/command
             sys.stderr.write("\n💥 Ask (Ctrl+D Submit, !cmd, @file, @url):\n")
-            lines = []
-            prompt_prefix = "> "
-            try:
-                while True:
-                    # Read line by line using input(), prompted to stderr
-                    line = input(prompt_prefix)
-                    lines.append(line)
-                    # prompt_prefix = "  " # Indent subsequent lines for multiline input clarity
-            except EOFError: # Ctrl+D detected
-                pass
+            lines_for_current_prompt = []
+            
+            # Inner loop for collecting one full multi-line user input
+            while True: 
+                prompt_char = "> " if not lines_for_current_prompt else "  "
+                try:
+                    current_line_text = input(prompt_char)
+                    lines_for_current_prompt.append(current_line_text)
+                
+                except EOFError: # Ctrl+D pressed
+                    sys.stderr.write(ANSI_GREEN + "^D EOF!\n" + ANSI_RESET) 
+                    break # Exit inner loop to process collected lines
 
-            user_input = '\n'.join(lines).strip()
+                except KeyboardInterrupt: # Ctrl+C pressed during input()
+                    sys.stderr.write(ANSI_GREEN + "^C Cancelled!\n" + ANSI_RESET);
+                    
+                    prompt_lines_has_content = False
+                    if readline_available:
+                        try:
+                            if readline.get_line_buffer() or bool(lines_for_current_prompt): 
+                                 prompt_lines_has_content = True
+                        except Exception:
+                            # If readline fails, assume line is empty for safety (will lead to exit)
+                            prompt_lines_has_content = False
 
-            # Prepend initial pipe input if this is the first interaction
-            if initial_pipe_input:
-                user_input = f"{initial_pipe_input.strip()}\n\nUser Query: {user_input}"
-                initial_pipe_input = "" # Clear it after first use
-
-            if not user_input:
-                continue # Skip if only whitespace or empty input after stripping
-
-            # --- Handle Commands ---
-            command_executed = False
-            temp_lines = []
-            for line in user_input.splitlines():
-                stripped_line = line.strip()
-                if stripped_line.startswith('!'):
-                    command_to_execute = stripped_line[1:].strip()
-                    if command_to_execute.lower() == 'clear':
-                        messages.clear()
-                        # os.system('clear' if os.name == 'posix' else 'cls') # Alternative clear screen
-                        sys.stdout.write(ANSI_CLEAR_SCREEN) # Use ANSI clear screen
-                        sys.stdout.flush()
-                        sys.stderr.write("Conversation history cleared.\n") # Use stderr for meta messages
-                        command_executed = True
-                        break # Don't process further lines if 'clear' is issued
-                    elif command_to_execute:
-                        sys.stderr.write(f"\nExecuting: `{command_to_execute}`\n---\n") # Command echo to stderr
-                        output_from_command = execute_command(command_to_execute)
-                        sys.stdout.write(output_from_command) # Command output to stdout
-                        sys.stdout.write("---\n")
-                        sys.stdout.flush()
-                        command_executed = True
-                        # Decide if command output should be part of the *next* prompt
-                        # For now, just execute and don't send to LLM or process further lines
-                        break
+                    if prompt_lines_has_content:
+                        # Line has content: clear it and let user re-enter the current line.
+                        # readline itself handles clearing the visual line on SIGINT.
+                        # sys.stderr.write("Current line input cancelled. Please re-enter.\n")
+                        # The `continue` re-prompts for the same line.
+                        # `lines_for_current_prompt` is not affected yet for this cancelled line.
+                        lines_for_current_prompt.clear()
+                        continue 
                     else:
-                         # Line starts with '!' but no command follows, treat as normal text
-                         temp_lines.append(line)
-                else:
-                    temp_lines.append(line)
-
-            if command_executed:
-                 continue # Go to next loop iteration if a command was run
-
-            # Reconstruct user_input if only some lines were commands
-            user_input = '\n'.join(temp_lines).strip()
-            if not user_input: # Check again if processing commands left input empty
+                        # Line is empty (or readline unavailable/failed): exit immediately.
+                        # sys.stderr.write("Input line empty, exiting program...\n")
+                        # This raise will be caught by the outermost `except KeyboardInterrupt`
+                        raise 
+            
+            # --- Processing the input after inner loop (Ctrl+D collected some lines) ---
+            user_input = '\n'.join(lines_for_current_prompt).strip()
+            
+            if initial_pipe_input:
+                user_input = f"Context from piped input:\n{initial_pipe_input.strip()}\n\nUser Query: {user_input}"
+                initial_pipe_input = "" 
+            
+            if not user_input: 
+                # This happens if user just pressed Ctrl+D on an empty prompt.
                 continue
 
-            # --- Process and Send to LLM ---
-            processed_input = process_input_directives(user_input)
-            messages.append({"role": "user", "content": processed_input})
+            # --- Process special commands ---
+            command_executed_this_turn, clear_command_issued = False, False
+            user_input_for_llm = user_input 
+            first_line_stripped = user_input.splitlines()[0].strip() if user_input else ""
 
-            sys.stdout.write("\n💡:\n") # Use stdout for the AI response prefix
-            sys.stdout.flush()
-            # <-- Pass model_type and hide_reasoning to stream_response -->
-            response_content = stream_response(
-                client, args.model, args.model_type, messages, args.max_tokens,
-                freq_penalty, pres_penalty, args.hide_reasoning
-            )
+            if first_line_stripped.startswith('!'):
+                command_to_execute = first_line_stripped[1:].strip()
+                if command_to_execute.lower() == 'clear':
+                    messages.clear(); sys.stdout.write(ANSI_CLEAR_SCREEN); sys.stdout.flush()
+                    sys.stderr.write("Conversation history cleared.\n")
+                    clear_command_issued, command_executed_this_turn = True, True
+                elif command_to_execute:
+                    sys.stderr.write(f"\nExecuting: `{command_to_execute}`\n---\n")
+                    output_from_command = execute_command(command_to_execute)
+                    sys.stdout.write(output_from_command)
+                    if not output_from_command.endswith('\n'): sys.stdout.write("\n")
+                    sys.stdout.write("---\n"); sys.stdout.flush()
+                    command_executed_this_turn, user_input_for_llm = True, ""
+                # else: just "!" which is not a special command, so falls through to LLM
+            
+            if clear_command_issued or (command_executed_this_turn and user_input_for_llm == ""):
+                continue 
+            if not user_input_for_llm.strip(): # If nothing left for LLM after cmd processing
+                continue
 
+            # --- Send to LLM ---
+            processed_input_for_llm = process_input_directives(user_input_for_llm)
+            messages.append({"role": "user", "content": processed_input_for_llm})
+            sys.stdout.write("💡:\n"); sys.stdout.flush()
+            response_content = stream_response(client, args.model, args.model_type, messages, args.max_tokens, freq_penalty, pres_penalty, args.hide_reasoning)
             if response_content is not None:
                 messages.append({"role": "assistant", "content": response_content})
-            # Ensure a newline separation before the next prompt, spinner stop handles its own newline
-            # sys.stdout.write("\n") # Removed as spinner stop adds newline
+                if not response_content.endswith('\n') and response_content != "": sys.stdout.write("\n")
+                sys.stdout.flush()
 
-    except KeyboardInterrupt:
-        sys.stderr.write("\nExiting...\n")
+    except KeyboardInterrupt: 
+        pass
+    except Exception as e:
+        sys.stderr.write(f"\nAn unexpected error occurred in main loop: {e}\n")
+        traceback.print_exc(file=sys.stderr)
     finally:
-        # --- Cleanup ---
         restore_stdin(original_stdin_fd)
 
 if __name__ == '__main__':
