@@ -8,7 +8,7 @@ import subprocess
 import requests
 import time
 import itertools
-import threading # Keep this one
+import threading
 import queue
 import traceback
 import wcwidth
@@ -16,7 +16,7 @@ from openai import OpenAI, APIError
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse
-import glob # Added for file path completion
+import glob # for file path completion
 
 try:
     from googlesearch import search as google_search_func # Alias to avoid name collision
@@ -47,7 +47,7 @@ DEFAULT_SEARCH_SLEEP_INTERVAL = 0 # Sleep interval for google search (seconds)
 USER_AGENT = "Mozilla/5.0 (Windows NT 1.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
 # Default parameters for keyword extraction LLM (can be overridden by CLI args)
-DEFAULT_SEARCH_KW_MAX_TOKENS = 60
+DEFAULT_SEARCH_KW_MAX_TOKENS = 1000
 DEFAULT_SEARCH_KW_TEMPERATURE = 0.2
 
 
@@ -193,24 +193,52 @@ def process_input_directives(
                 original_query = ""
                 try:
                     original_query = match.group(1).strip()
-                    query_to_search = original_query
+                    query_to_search = original_query 
 
-                    # Determine LLM client and model for keyword extraction
+                    def clean_keywords_output(raw_keywords: Optional[str]) -> str:
+                        if not raw_keywords:
+                            return ""
+                        
+                        text = raw_keywords.strip()
+                        if not text:
+                            return ""
+
+                        think_start_tag = "<think>"
+                        think_end_tag = "</think>"
+                        
+                        last_end_tag_pos = text.rfind(think_end_tag)
+                        
+                        if last_end_tag_pos != -1:
+                            # Found at least one </think> tag
+                            content_after = text[last_end_tag_pos + len(think_end_tag):].strip()
+                            if content_after: # If there's meaningful content AFTER the last </think>, use it.
+                                return content_after
+                            else:
+                                # </think> was found, but nothing meaningful after it.
+                                # This covers cases like "<think>keywords</think>" which results in content_after being "".
+                                return "" 
+                        else:
+                            # No </think> tag found anywhere in the text.
+                            # If there's a <think> tag, it's an unclosed/malformed block.
+                            if think_start_tag in text:
+                                return ""
+                            else:
+                                # No <think> or </think> tags found. Assume the whole text is keywords.
+                                return text
+                    
                     llm_for_keywords_enabled = False
                     final_kw_client = None
                     final_kw_model = None
 
-                    if search_kw_model_name_param:  # Dedicated keyword model specified by user
+                    if search_kw_model_name_param: 
                         chosen_kw_api_url = search_kw_api_url_param
-                        if not chosen_kw_api_url: # Fallback to main LLM's URL or default
+                        if not chosen_kw_api_url: 
                             chosen_kw_api_url = str(main_llm_client.base_url) if main_llm_client and main_llm_client.base_url else DEFAULT_API_URL
                         
                         chosen_kw_api_key = search_kw_api_key_param
-                        if chosen_kw_api_key is None and main_llm_client : # Fallback to main LLM's key if specific KW key not given
+                        if chosen_kw_api_key is None and main_llm_client : 
                             chosen_kw_api_key = main_llm_client.api_key
-                        # If chosen_kw_api_key is still None, it's passed as None to OpenAI client.
-
-                        # Ensure URL is string
+                        
                         if chosen_kw_api_url and not isinstance(chosen_kw_api_url, str):
                             chosen_kw_api_url = str(chosen_kw_api_url)
 
@@ -223,8 +251,7 @@ def process_input_directives(
                             sys.stderr.write(f"Using dedicated LLM for keywords: {final_kw_model} at {chosen_kw_api_url}\n")
                         except Exception as e_kw_client:
                             sys.stderr.write(f"\r{ANSI_EL}Error initializing dedicated keyword LLM client ({search_kw_model_name_param}): {e_kw_client}. Keyword LLM disabled. ⚠️\n")
-                            # Fallback is implicitly handled as llm_for_keywords_enabled remains False
-                    elif main_llm_client and main_llm_model:  # Fallback to main LLM if available and no dedicated one
+                    elif main_llm_client and main_llm_model: 
                         final_kw_client = main_llm_client
                         final_kw_model = main_llm_model
                         llm_for_keywords_enabled = True
@@ -238,11 +265,11 @@ def process_input_directives(
                                     model=model_param,
                                     messages=messages_param,
                                     max_tokens=max_tokens_param_kw,
-                                    temperature=temperature_param_kw # Use new temperature parameter
+                                    temperature=temperature_param_kw
                                 )
                                 if completion_kw.choices and completion_kw.choices[0].message and completion_kw.choices[0].message.content:
-                                    res = completion_kw.choices[0].message.content.strip()
-                                    q_result.put(('SUCCESS', res if res else None))
+                                    res = completion_kw.choices[0].message.content 
+                                    q_result.put(('SUCCESS', res if res else None)) 
                                 else:
                                     q_result.put(('FAILURE', "No content in LLM response for keywords."))
                             except APIError as e_api_kw:
@@ -273,8 +300,9 @@ def process_input_directives(
                         kw_thread.start()
 
                         kw_extraction_done = False
-                        extracted_keywords_from_llm = None
+                        extracted_keywords_from_llm = None 
                         status_kw_extraction = "PENDING"
+                        kw_data_from_q_error_info = None 
 
                         while kw_thread.is_alive():
                             sys.stderr.write(f"\r{ANSI_EL}Extracting keywords using {final_kw_model}... {next(spinner_chars_local)}")
@@ -282,9 +310,15 @@ def process_input_directives(
                             time.sleep(0.1)
                             try:
                                 status_type_kw, kw_data_from_q = q_kw.get_nowait()
-                                if status_type_kw == 'SUCCESS': extracted_keywords_from_llm = kw_data_from_q; status_kw_extraction = "SUCCESS"
-                                elif status_type_kw == 'FAILURE': status_kw_extraction = "FAILURE_API" 
-                                elif status_type_kw == 'ERROR': status_kw_extraction = "ERROR_THREAD"
+                                if status_type_kw == 'SUCCESS': 
+                                    extracted_keywords_from_llm = kw_data_from_q
+                                    status_kw_extraction = "SUCCESS"
+                                elif status_type_kw == 'FAILURE': 
+                                    status_kw_extraction = "FAILURE_API"
+                                    kw_data_from_q_error_info = kw_data_from_q
+                                elif status_type_kw == 'ERROR': 
+                                    status_kw_extraction = "ERROR_THREAD"
+                                    kw_data_from_q_error_info = kw_data_from_q
                                 kw_extraction_done = True; break
                             except queue.Empty: continue
                         
@@ -293,27 +327,40 @@ def process_input_directives(
                         if not kw_extraction_done:
                             try:
                                 status_type_kw, kw_data_from_q = q_kw.get_nowait()
-                                if status_type_kw == 'SUCCESS': extracted_keywords_from_llm = kw_data_from_q; status_kw_extraction = "SUCCESS"
-                                elif status_type_kw == 'FAILURE': status_kw_extraction = "FAILURE_API"
-                                elif status_type_kw == 'ERROR': status_kw_extraction = "ERROR_THREAD"
-                            except queue.Empty: status_kw_extraction = "ERROR_NO_RESULT"
+                                if status_type_kw == 'SUCCESS': 
+                                    extracted_keywords_from_llm = kw_data_from_q
+                                    status_kw_extraction = "SUCCESS"
+                                elif status_type_kw == 'FAILURE': 
+                                    status_kw_extraction = "FAILURE_API"
+                                    kw_data_from_q_error_info = kw_data_from_q
+                                elif status_type_kw == 'ERROR': 
+                                    status_kw_extraction = "ERROR_THREAD"
+                                    kw_data_from_q_error_info = kw_data_from_q
+                            except queue.Empty: 
+                                status_kw_extraction = "ERROR_NO_RESULT"
                         
-                        if status_kw_extraction == "SUCCESS" and extracted_keywords_from_llm:
-                            query_to_search = extracted_keywords_from_llm
-                            sys.stderr.write(f"\r{ANSI_EL}Keywords extracted: '{query_to_search}' ✅\n")
-                        elif status_kw_extraction == "SUCCESS" and not extracted_keywords_from_llm:
-                            sys.stderr.write(f"\r{ANSI_EL}Keyword extraction returned empty, using original query. ✅\n")
+                        if status_kw_extraction == "SUCCESS":
+                            # --- DEBUG PRINT ADDED HERE ---
+                            # sys.stderr.write(f"\r{ANSI_EL}DEBUG: Raw keywords from LLM: '{extracted_keywords_from_llm}'\n")
+                            # sys.stderr.flush() # Ensure it's printed immediately
+                            # --- END DEBUG PRINT ---
+                            processed_keywords = clean_keywords_output(extracted_keywords_from_llm)
+                            if processed_keywords:
+                                query_to_search = processed_keywords
+                                sys.stderr.write(f"\r{ANSI_EL}Keywords processed from LLM: '{query_to_search}' ✅\n")
+                            else:
+                                sys.stderr.write(f"\r{ANSI_EL}LLM keyword output empty or unsuitable after processing. Using original query. ✅\n")
                         elif status_kw_extraction == "FAILURE_API":
-                             sys.stderr.write(f"\r{ANSI_EL}LLM keyword extraction issue ({kw_data_from_q if 'kw_data_from_q' in locals() else 'reason unknown'}), using original. ⚠️\n")
-                        elif status_kw_extraction in ["ERROR_THREAD", "ERROR_NO_RESULT"]:
-                            err_msg_detail = kw_data_from_q if 'kw_data_from_q' in locals() and status_kw_extraction == "ERROR_THREAD" else "thread comm error"
-                            sys.stderr.write(f"\r{ANSI_EL}Keyword extraction failed ({err_msg_detail}). Using original. ❌\n")
-                        else: # PENDING or other unknown
+                             sys.stderr.write(f"\r{ANSI_EL}LLM keyword extraction issue ({kw_data_from_q_error_info if kw_data_from_q_error_info else 'reason unknown'}), using original. ⚠️\n")
+                        elif status_kw_extraction == "ERROR_THREAD":
+                            sys.stderr.write(f"\r{ANSI_EL}Keyword extraction failed ({kw_data_from_q_error_info if kw_data_from_q_error_info else 'thread error details missing'}). Using original. ❌\n")
+                        elif status_kw_extraction == "ERROR_NO_RESULT":
+                            sys.stderr.write(f"\r{ANSI_EL}Keyword extraction failed (thread did not return result). Using original. ❌\n")
+                        else: # PENDING or other unknown status
                             sys.stderr.write(f"\r{ANSI_EL}Keyword extraction status unclear or took too long, using original query. ⚠️\n")
                         sys.stderr.flush()
-                    else: # LLM for keywords not enabled or not configured
-                        # sys.stderr.write("LLM-based keyword extraction skipped.\n") # Optional: can be noisy
-                        pass # query_to_search remains original_query
+                    else: 
+                        pass 
                     
                     sys.stderr.write(f"Searching online for: '{query_to_search}'... ")
                     sys.stderr.flush()
@@ -560,10 +607,10 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                             clear_thinking_indicator_if_on_screen()
                             is_reasoning_deepseek = False
                             if not hide_reasoning:
-                                sys.stdout.write(ANSI_RESET + REASONING_END_MARKER + "\n"); sys.stdout.flush()
+                                sys.stdout.write(ANSI_RESET + "\n" + REASONING_END_MARKER + "\n"); sys.stdout.flush()
                                 strip_leading_newline_next_write = True
 
-                        if model_type != 'gemini' and spinner_active:
+                        if model_type != 'gemini' and spinner_active and not in_think_block_tag: # Only stop if not entering think block
                             stop_spinner()
 
                         full_response_chunks.append(content)
@@ -604,8 +651,9 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                                         update_spinner()
                                     else:
                                         if spinner_active: stop_spinner()
-                                        sys.stdout.write(ANSI_GREEN); sys.stdout.flush()
-                                        strip_leading_newline_next_write = False
+                                        sys.stdout.write(REASONING_START_MARKER + ANSI_GREEN)
+                                        sys.stdout.flush()
+                                        strip_leading_newline_next_write = False 
                             else: 
                                 think_end_pos = current_processing_buffer.find('</think>', temp_idx)
                                 if think_end_pos == -1:
@@ -615,13 +663,16 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                                     else: write_thinking_chunk_with_indicator(think_content_chunk)
                                 else:
                                     think_content_chunk = current_processing_buffer[temp_idx:think_end_pos]
-                                    if not hide_reasoning:
-                                        write_thinking_chunk_with_indicator(think_content_chunk)
+                                    if not hide_reasoning: 
+                                        if think_content_chunk:
+                                            write_thinking_chunk_with_indicator(think_content_chunk)
                                         clear_thinking_indicator_if_on_screen()
-                                        sys.stdout.write(ANSI_RESET); sys.stdout.flush()
+                                        sys.stdout.write(ANSI_RESET + REASONING_END_MARKER + '\n')
+                                        sys.stdout.flush()
                                         strip_leading_newline_next_write = True
                                     elif hide_reasoning:
-                                         update_spinner()
+                                         if spinner_active: 
+                                            stop_spinner()   
                                     
                                     temp_idx = think_end_pos + len('</think>')
                                     in_think_block_tag = False
@@ -638,6 +689,7 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
 
                 elif item_type == 'DONE':
                     clear_thinking_indicator_if_on_screen()
+                    if spinner_active: stop_spinner(success=final_status_success) 
                     break
                 elif item_type == 'ERROR':
                     final_status_success = False
@@ -654,45 +706,45 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
                     clear_thinking_indicator_if_on_screen()
                     try:
                         item_type, data = q.get_nowait()
-                        if item_type == 'DONE': break
+                        if item_type == 'DONE':
+                            if spinner_active: stop_spinner(success=final_status_success) 
+                            break
                         if item_type == 'ERROR':
                             final_status_success = False; stop_spinner(success=False)
                             if (is_reasoning_deepseek or in_think_block_tag) and not hide_reasoning: sys.stdout.write(ANSI_RESET)
                             sys.stdout.flush(); sys.stderr.write(f"\n{data}\n"); return None
                     except queue.Empty:
-                        if final_status_success: # Only write error if not already errored out
+                        if final_status_success: 
                             final_status_success = False; stop_spinner(success=False)
                             sys.stderr.write(f"\n{ANSI_EL}Worker thread finished unexpectedly.\n")
-                        return None # Return None if worker died and no error was queued by it
-                    # If we broke from inner try due to DONE/ERROR after worker died, outer loop will catch DONE
-                    # or the error would have been handled and returned.
-                    # This break is to exit the `while True` if the worker died and we got a final item.
+                        return None 
                     break 
 
         clear_thinking_indicator_if_on_screen()
-        if spinner_active: stop_spinner(success=final_status_success)
+        if spinner_active: stop_spinner(success=final_status_success) 
 
-        if not hide_reasoning:
-            if is_reasoning_deepseek:
-                sys.stdout.write(ANSI_RESET + "\n" + REASONING_END_MARKER + "\n")
-            if in_think_block_tag: 
+        if not hide_reasoning: 
+            if is_reasoning_deepseek: 
+                sys.stdout.write(ANSI_RESET) 
+                sys.stdout.write("\n" + REASONING_END_MARKER + "\n")
+            elif in_think_block_tag: 
                 sys.stdout.write(ANSI_RESET)
-        sys.stdout.flush()
+                sys.stdout.write("\n" + REASONING_END_MARKER + "\n")
+        sys.stdout.flush() 
 
         processed_response = "".join(processed_response_chunks)
         return processed_response.lstrip('\n') if processed_response else ""
 
     except KeyboardInterrupt:
-        final_status_success = False # Ensure spinner stops with error indication
+        final_status_success = False 
         sys.stdout.write(ANSI_RESET); sys.stderr.write(ANSI_RESET) 
         sys.stdout.flush(); sys.stderr.flush()
         clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
-        if not hide_reasoning:
+        if not hide_reasoning: 
             if is_reasoning_deepseek or in_think_block_tag:
-                 sys.stdout.write(ANSI_RESET); sys.stdout.flush()
-                 # Avoid printing end marker if it was never started or already reset.
-                 # If it was truly mid-reasoning, a visual reset is enough.
-                 # sys.stderr.write(f"\n{REASONING_END_MARKER if is_reasoning_deepseek else '</think>'}\n(Interrupted during reasoning/thinking)\n")
+                 sys.stdout.write(ANSI_RESET)
+                 sys.stdout.write("\n" + REASONING_END_MARKER + "\n")
+                 sys.stdout.flush()
         sys.stderr.write(f"{ANSI_GREEN}\n^C Cancelled Stream!\n{ANSI_RESET}"); sys.stderr.flush()
         if TERMIOS_AVAILABLE:
             try:
@@ -704,20 +756,18 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
     except Exception as e:
         final_status_success = False
         clear_thinking_indicator_if_on_screen(); stop_spinner(success=False)
-        if not hide_reasoning and (is_reasoning_deepseek or in_think_block_tag): sys.stdout.write(ANSI_RESET)
-        sys.stdout.flush()
+        if not hide_reasoning and (is_reasoning_deepseek or in_think_block_tag): 
+            sys.stdout.write(ANSI_RESET)
+            sys.stdout.write("\n" + REASONING_END_MARKER + "\n") 
+            sys.stdout.flush() 
         sys.stderr.write(f"\n{ANSI_EL}An unexpected error occurred in stream_response: {str(e)}\n")
         traceback.print_exc(file=sys.stderr)
         return None
     finally:
         clear_thinking_indicator_if_on_screen()
-        # Check if spinner_active exists in local scope before trying to clear it
         if 'spinner_active' in locals() and spinner_active : 
-             sys.stderr.write(f"\r{ANSI_EL}"); sys.stderr.flush()
+             sys.stderr.write(f"\r{ANSI_EL}"); sys.stderr.flush() 
         if 'worker_thread' in locals() and worker_thread.is_alive():
-            # We should not be joining here if the main loop exited normally,
-            # as the worker thread should have put 'DONE' or 'ERROR' and exited.
-            # This join is more of a safeguard or for unexpected exits from stream_response.
             worker_thread.join(timeout=1.0) 
 
 
@@ -859,16 +909,9 @@ def main():
 
     client = None
     try:
-        # Initialize main client only if not relying solely on dedicated keyword client for all LLM tasks (though usually main client is expected)
-        # This script structure implies a main client is generally expected for chat.
-        # Keyword client is created on-demand in process_input_directives if needed.
         client = OpenAI( base_url=args.api_url, api_key=args.api_key )
     except Exception as e:
-        # If only raw_text with @search is used, and a dedicated keyword client is specified, this failure might be acceptable.
-        # However, for general use, main client initialization is important.
         sys.stderr.write(f"Warning: Error initializing main OpenAI client: {e}\n")
-        # Do not exit if user might be using @search with its own client.
-        # If client remains None, chat functionalities won't work, but @search with dedicated client might.
 
     messages: List[Dict[str, str]] = []
     original_stdin_fd, initial_pipe_input_content = setup_tty_stdin()
@@ -912,19 +955,13 @@ def main():
             
             if not client and not args.grep_enabled and not ("@search" in user_content or "@file" in user_content or "@url" in user_content):
                  sys.exit("Error: Main LLM client not initialized and no directives found in raw_text input.")
-            elif not client and args.grep_enabled: # Should have been caught earlier but as a safeguard
+            elif not client and args.grep_enabled: 
                  sys.exit("Error: Main LLM client not initialized, required for --grep-enabled.")
 
-
-            # Only call stream_response if not solely relying on directives processed by process_input_directives
-            # and if client is available for a chat completion. Grep mode always needs it.
-            # If it was just @file/@url/@search, process_input_directives handled it.
-            # This path (raw_text) usually implies a direct query to the LLM.
-            if client: # If main client is available
+            if client: 
                 response_content = stream_response(client, args.model, args.model_type, messages, args.max_tokens, freq_penalty, pres_penalty, args.hide_reasoning)
                 if response_content is not None and not response_content.endswith('\n'): sys.stdout.write("\n")
             elif not ("@search" in user_content or "@file" in user_content or "@url" in user_content):
-                # No client and no directives that could have produced output (like search results to context)
                 sys.stderr.write("No main LLM client and no directives to process. Exiting.\n")
             
             sys.stdout.flush(); sys.exit(0)
@@ -1007,4 +1044,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
