@@ -569,7 +569,7 @@ def stream_response(client: OpenAI, model: str, model_type: str, messages: List[
 
     final_status_success = True
     try:
-        if hide_reasoning: start_spinner()
+        if hide_reasoning and model_type == 'gemini': start_spinner()
 
         while True:
             try:
