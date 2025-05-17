@@ -52,6 +52,7 @@ DEFAULT_SEARCH_KW_TEMPERATURE = 0.2
 
 
 ANSI_GREEN = '\033[32m'
+ANSI_MAGENTA = '\033[35m'
 ANSI_RESET = '\033[0m'
 ANSI_SAVE_CURSOR = '\033[s'
 ANSI_RESTORE_CURSOR = '\033[u'
@@ -976,7 +977,7 @@ def main():
             if initial_pipe_input_content and not has_used_initial_pipe_input:
                 current_prompt_accumulator.append(f"Context from initial piped input:\n{initial_pipe_input_content.strip()}")
             while True:
-                prompt_char = "  " if '\n'.join(current_prompt_accumulator).strip() else "> "
+                prompt_char = ANSI_MAGENTA + "... " + ANSI_RESET if '\n'.join(current_prompt_accumulator).strip() else ANSI_MAGENTA + ">>> " + ANSI_RESET
                 try:
                     user_line_input = input(prompt_char)
                     stripped_user_line = user_line_input.strip()
@@ -1027,7 +1028,7 @@ def main():
                 if response_content and not response_content.endswith('\n'): sys.stdout.write("\n")
                 sys.stdout.flush()
             sys.stdout.write(ANSI_RESET); sys.stdout.flush()
-    except KeyboardInterrupt: sys.stderr.write(f"\n{ANSI_RESET}Exiting due to user interrupt.\n")
+    except KeyboardInterrupt: sys.stderr.write(ANSI_RESET)
     except Exception as e:
         sys.stderr.write(f"\n{ANSI_RESET}Unexpected error in main loop: {e}\n"); traceback.print_exc(file=sys.stderr)
     finally:
